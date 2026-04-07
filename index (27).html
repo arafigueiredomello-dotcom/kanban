@@ -1,0 +1,3027 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kanban</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<!-- Firebase -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getDatabase, ref, onValue, set } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+
+// ══════════════════════════════════════════════
+// SUAS CREDENCIAIS DO FIREBASE
+// ══════════════════════════════════════════════
+const firebaseConfig = {
+  apiKey: "AIzaSyCfIwQI5ZrIvqOZhRZyGu0cCfQMJ6KEwj4",
+  authDomain: "kanban-tori.firebaseapp.com",
+  databaseURL: "https://kanban-tori-default-rtdb.firebaseio.com",
+  projectId: "kanban-tori",
+  storageBucket: "kanban-tori.firebasestorage.app",
+  messagingSenderId: "735996772849",
+  appId: "1:735996772849:web:3e4afcd47cd69a21d24450",
+  measurementId: "G-P7E4DFM2L8"
+};
+// ══════════════════════════════════════════════
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getDatabase(app);
+
+let currentUser = null;
+let remoteData = null;
+let isSaving = false;
+let pendingSave = null;
+const CODE_VERSION = 3;
+
+// ── AUTH STATE ──
+onAuthStateChanged(auth, user => {
+  if (user) {
+    currentUser = user;
+    showApp(user);
+    startListening();
+  } else {
+    currentUser = null;
+    showLogin();
+  }
+});
+
+function showLogin() {
+  document.getElementById('loginScreen').style.display = 'flex';
+  document.getElementById('appScreen').style.display = 'none';
+}
+
+function showApp(user) {
+  document.getElementById('loginScreen').style.display = 'none';
+  document.getElementById('appScreen').style.display = 'block';
+  document.getElementById('userEmail').textContent = user.email;
+}
+
+// ── FIREBASE LOGIN ──
+window.doLogin = async function() {
+  const email = document.getElementById('loginEmail').value.trim();
+  const pass  = document.getElementById('loginPass').value;
+  const btn   = document.getElementById('loginBtn');
+  const err   = document.getElementById('loginError');
+  err.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Entrando…';
+  try {
+    await signInWithEmailAndPassword(auth, email, pass);
+  } catch(e) {
+    const msgs = {
+      'auth/user-not-found': 'Usuário não encontrado.',
+      'auth/wrong-password': 'Senha incorreta.',
+      'auth/invalid-email': 'E-mail inválido.',
+      'auth/invalid-credential': 'E-mail ou senha incorretos.',
+      'auth/too-many-requests': 'Muitas tentativas. Tente mais tarde.'
+    };
+    err.textContent = msgs[e.code] || 'Erro ao entrar. Verifique suas credenciais.';
+    btn.disabled = false;
+    btn.textContent = 'Entrar';
+  }
+};
+
+window.doLogout = async function() {
+  await signOut(auth);
+};
+
+// Permitir Enter no login
+window.loginKeydown = function(e) {
+  if (e.key === 'Enter') window.doLogin();
+};
+
+// Firebase salva arrays como objetos {0:..., 1:...} — converte de volta pra array
+function toArr(val) {
+  if (!val) return [];
+  if (Array.isArray(val)) return val;
+  return Object.values(val);
+}
+
+function normalizeFirebase(val) {
+  const d = JSON.parse(JSON.stringify(val));
+  d.boards = toArr(d.boards);
+  if (!d.cols) d.cols = {};
+  Object.keys(d.cols).forEach(boardId => {
+    d.cols[boardId] = toArr(d.cols[boardId]);
+    d.cols[boardId].forEach(col => {
+      col.cards = toArr(col.cards);
+      col.cards.forEach(card => {
+        if (card.history) card.history = toArr(card.history);
+      });
+    });
+  });
+  return d;
+}
+
+// ── FIREBASE SYNC ──
+function startListening() {
+  const dbRef = ref(db, 'kanban');
+  onValue(dbRef, snapshot => {
+    const val = snapshot.val();
+    if (val) {
+      remoteData = val;
+      // Se outra aba salvou com versão mais nova, recarregar
+      if (val._v && val._v > CODE_VERSION) { location.reload(); return; }
+      // Ignorar snapshots enquanto estamos salvando (evita loop Firebase)
+      if (isSaving) return;
+      // Ignorar dados de código antigo (sem _v:3) — mas só se já temos dados carregados
+      // Usa setTimeout para sair do contexto do listener antes de salvar
+      if (data && (!val._v || val._v < CODE_VERSION)) {
+        setTimeout(() => saveToFirebase(), 0);
+        return;
+      }
+      if (true) {
+        data = normalizeFirebase(val);
+        data.cardForms = {};
+        data.addColForm = false;
+        data.showNewBoard = false;
+        data.newBoardName = '';
+        data.newColName = '';
+        if (!data.boards || data.boards.length === 0) {
+          data.boards = JSON.parse(JSON.stringify(INITIAL_DATA.boards));
+        }
+        data.boards.forEach(b => {
+          if (!data.cols[b.id]) data.cols[b.id] = [];
+          // Garantir as 4 colunas fixas sempre existem
+          const cols = data.cols[b.id];
+          const FIXED = [
+            { id: 'c1', name: 'Solicitado' },
+            { id: 'c2', name: 'Enviado' },
+            { id: 'c3', name: 'Concluído' },
+            { id: 'c4', name: 'Resgatado', _resgatado: true }
+          ];
+          let changed = false;
+          FIXED.forEach(def => {
+            if (!cols.find(c => c.name === def.name)) {
+              cols.push({ id: def.id, name: def.name, cards: [], ...(def._resgatado ? { _resgatado: true } : {}) });
+              changed = true;
+            }
+          });
+          // Garantir _resgatado na coluna Resgatado
+          const res = cols.find(c => c.name === 'Resgatado');
+          if (res && !res._resgatado) { res._resgatado = true; changed = true; }
+        });
+        // Nota: não salvar aqui para evitar loop Firebase
+        if (!data.activeBoard || !data.boards.find(b => b.id === data.activeBoard)) {
+          data.activeBoard = data.boards[0].id;
+        }
+        render();
+      }
+    } else {
+      data = JSON.parse(JSON.stringify(INITIAL_DATA));
+      saveToFirebase();
+      render();
+    }
+  });
+}
+
+function saveToFirebase() {
+  if (isSaving) {
+    pendingSave = true;
+    return;
+  }
+  isSaving = true;
+  const toSave = {
+    boards: data.boards,
+    activeBoard: data.activeBoard,
+    cols: data.cols,
+    _v: CODE_VERSION
+  };
+  set(ref(db, 'kanban'), toSave).then(() => {
+    isSaving = false;
+    if (pendingSave) {
+      pendingSave = false;
+      saveToFirebase();
+    }
+  }).catch(err => {
+    isSaving = false;
+    console.error('Erro ao salvar:', err);
+  });
+}
+
+// Expõe para o código legado
+window._firebaseSave = saveToFirebase;
+window._firebaseUser = () => currentUser;
+
+// Salva posições no Firebase
+window._firebaseSavePosicoes = function(nova) {
+  set(ref(db, 'posicoes'), nova).catch(err => console.error('Erro ao salvar posições:', err));
+};
+
+// Carrega posições do Firebase ao iniciar
+onValue(ref(db, 'posicoes'), snapshot => {
+  const val = snapshot.val();
+  if (val && typeof val === 'object' && Object.keys(val).length > 0) {
+    posicoes = val;
+    const total = Object.keys(val).length;
+    const badge = document.getElementById('posicoesBadge');
+    if (badge) {
+      badge.style.display = 'inline-block';
+      badge.textContent = '📊 ' + total + ' clientes';
+    }
+  }
+});
+
+
+</script>
+<style>
+  :root {
+    --bg: #f5f4f0;
+    --surface: #ffffff;
+    --surface2: #f0efe9;
+    --border: #e2e0d8;
+    --border2: #ccc9be;
+    --text: #1c1b18;
+    --text2: #6b6860;
+    --text3: #a09d96;
+    --accent: #1c1b18;
+    --radius: 10px;
+    --radius-sm: 6px;
+    --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+    --shadow-md: 0 4px 12px rgba(0,0,0,0.08), 0 2px 4px rgba(0,0,0,0.04);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'DM Sans', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    overflow-x: auto;
+  }
+
+  /* ── LOGIN SCREEN ── */
+  #loginScreen {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    background: var(--bg);
+  }
+
+  .login-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 36px 32px;
+    width: 360px;
+    max-width: 92vw;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    box-shadow: var(--shadow-md);
+  }
+
+  .login-logo {
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: -0.4px;
+    color: var(--text);
+  }
+
+  .login-subtitle {
+    font-size: 13px;
+    color: var(--text2);
+    margin-top: -8px;
+  }
+
+  .login-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text2);
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+  }
+
+  .login-input {
+    width: 100%;
+    padding: 9px 12px;
+    font-size: 13px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface2);
+    color: var(--text);
+    outline: none;
+    font-family: 'DM Sans', sans-serif;
+    transition: border-color .15s;
+  }
+  .login-input:focus { border-color: var(--border2); background: var(--surface); }
+
+  .login-btn {
+    width: 100%;
+    padding: 10px;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: 'DM Sans', sans-serif;
+    transition: opacity .15s;
+  }
+  .login-btn:hover { opacity: .85; }
+  .login-btn:disabled { opacity: .45; cursor: default; }
+
+  .login-error {
+    font-size: 12px;
+    color: #b94040;
+    background: #fde8e8;
+    border: 1px solid #f5b8b8;
+    border-radius: var(--radius-sm);
+    padding: 8px 12px;
+    display: none;
+  }
+  .login-error:not(:empty) { display: block; }
+
+  /* ── TOPBAR ── */
+  .topbar {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    gap: 0;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .topbar-logo {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+    margin-right: 32px;
+    letter-spacing: -0.3px;
+  }
+
+  .board-tabs {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex: 1;
+    overflow-x: auto;
+  }
+
+  .board-tab {
+    padding: 0 14px;
+    height: 52px;
+    font-size: 13px;
+    font-family: 'DM Sans', sans-serif;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text2);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color .15s, border-color .15s;
+    font-weight: 400;
+  }
+
+  .board-tab:hover { color: var(--text); }
+  .board-tab.active { color: var(--text); border-bottom-color: var(--text); font-weight: 500; }
+
+  .board-tab-add {
+    padding: 0 12px;
+    height: 52px;
+    background: none;
+    border: none;
+    color: var(--text3);
+    cursor: pointer;
+    font-size: 20px;
+    line-height: 1;
+    transition: color .15s;
+  }
+  .board-tab-add:hover { color: var(--text2); }
+
+  .topbar-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: auto;
+  }
+
+  .user-badge {
+    font-size: 12px;
+    color: var(--text2);
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 4px 10px;
+    font-family: 'DM Mono', monospace;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .btn-icon {
+    width: 32px; height: 32px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    cursor: pointer;
+    color: var(--text2);
+    font-size: 14px;
+    transition: background .15s, color .15s;
+  }
+  .btn-icon:hover { background: var(--surface2); color: var(--text); }
+
+  /* SYNC INDICATOR */
+  .sync-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: #22c55e;
+    display: inline-block;
+    margin-right: 4px;
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%,100% { opacity: 1; }
+    50% { opacity: .4; }
+  }
+
+  /* BOARD */
+  .board-wrap {
+    padding: 24px;
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+    min-height: calc(100vh - 52px);
+  }
+
+  /* COLUMN */
+  .col {
+    width: 252px;
+    min-width: 252px;
+    background: var(--surface2);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    transition: border-color .15s;
+  }
+
+  .col.drag-over-col {
+    border-color: var(--border2);
+    background: #eceae2;
+  }
+
+  .col-header {
+    display: flex;
+    align-items: center;
+    padding: 12px 12px 8px;
+    gap: 8px;
+  }
+
+  .col-name {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text2);
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    flex: 1;
+    cursor: text;
+    outline: none;
+    border: none;
+    background: none;
+    font-family: 'DM Sans', sans-serif;
+  }
+
+  .col-name:focus {
+    color: var(--text);
+  }
+
+  .col-count {
+    font-size: 11px;
+    background: var(--surface);
+    color: var(--text3);
+    border-radius: 20px;
+    padding: 1px 7px;
+    border: 1px solid var(--border);
+    font-family: 'DM Mono', monospace;
+  }
+
+  .col-menu-btn {
+    width: 22px; height: 22px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 4px;
+    border: none;
+    background: none;
+    cursor: pointer;
+    color: var(--text3);
+    font-size: 16px;
+    opacity: 0;
+    transition: opacity .15s, background .15s;
+  }
+  .col:hover .col-menu-btn { opacity: 1; }
+  .col-menu-btn:hover { background: var(--border); color: var(--text); }
+
+  /* CARDS AREA */
+  .cards-area {
+    padding: 0 8px 8px;
+    min-height: 40px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 1;
+  }
+
+  /* CARD */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    cursor: grab;
+    position: relative;
+    transition: border-color .15s, box-shadow .15s, opacity .15s;
+    animation: cardIn .18s ease;
+  }
+
+  @keyframes cardIn {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .card:active { cursor: grabbing; }
+  .card.dragging { opacity: .35; box-shadow: none; }
+  .card.drag-over { border-color: var(--border2); box-shadow: 0 0 0 2px var(--border2); }
+  .card:hover { border-color: var(--border2); box-shadow: var(--shadow); }
+
+  .card.op-aplicacao  { background: #f0faf4; border-color: #a8d9b8; }
+  .card.op-aplicacao:hover  { border-color: #6dbf8a; }
+  .card.op-resgate_total  { background: #fff5f5; border-color: #f5b8b8; }
+  .card.op-resgate_total:hover  { border-color: #e87a7a; }
+  .card.op-resgate_parcial  { background: #fffbf0; border-color: #f5d98a; }
+  .card.op-resgate_parcial:hover  { border-color: #e8bc30; }
+
+  .card-back-btn {
+    display: none;
+    position: absolute;
+    bottom: 6px; right: 6px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 7px;
+    font-size: 11px;
+    cursor: pointer;
+    color: var(--text2);
+    font-family: 'DM Sans', sans-serif;
+    transition: background .1s;
+    gap: 3px;
+    align-items: center;
+  }
+  .card:hover .card-back-btn { display: flex; }
+  .card-back-btn:hover { background: var(--border); }
+
+  .card-title {
+    font-size: 13px;
+    color: var(--text);
+    line-height: 1.45;
+    word-break: break-word;
+    font-weight: 400;
+  }
+
+  .card-desc {
+    font-size: 11px;
+    color: var(--text3);
+    margin-top: 5px;
+    line-height: 1.5;
+  }
+
+  .card-tag {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 20px;
+    margin-top: 7px;
+    letter-spacing: .02em;
+  }
+
+  .card-actions {
+    display: none;
+    position: absolute;
+    top: 6px; right: 6px;
+    gap: 3px;
+  }
+  .card:hover .card-actions { display: flex; }
+
+  .card-action-btn {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 7px;
+    font-size: 11px;
+    cursor: pointer;
+    color: var(--text2);
+    font-family: 'DM Sans', sans-serif;
+    transition: background .1s;
+  }
+  .card-action-btn:hover { background: var(--border); }
+  .card-action-btn.del { color: #b94040; }
+  .card-action-btn.del:hover { background: #fde8e8; border-color: #f0b8b8; }
+
+  /* ADD CARD BTN */
+  .add-card-btn {
+    margin: 0 8px 10px;
+    padding: 7px 10px;
+    background: none;
+    border: 1px dashed var(--border2);
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    color: var(--text3);
+    cursor: pointer;
+    width: calc(100% - 16px);
+    text-align: left;
+    font-family: 'DM Sans', sans-serif;
+    transition: background .15s, color .15s, border-color .15s;
+  }
+  .add-card-btn:hover { background: var(--surface); color: var(--text2); border-color: var(--border2); }
+
+  /* CARD FORM */
+  .card-form {
+    margin: 0 8px 10px;
+    background: var(--surface);
+    border: 1px solid var(--border2);
+    border-radius: var(--radius-sm);
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }
+
+  .card-form input,
+  .card-form textarea,
+  .card-form select {
+    width: 100%;
+    font-size: 12px;
+    padding: 6px 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface2);
+    color: var(--text);
+    outline: none;
+    resize: none;
+    font-family: 'DM Sans', sans-serif;
+    transition: border-color .15s;
+  }
+  .card-form input:focus,
+  .card-form textarea:focus { border-color: var(--border2); background: var(--surface); }
+
+  .form-row { display: flex; gap: 6px; }
+
+  .btn-primary {
+    flex: 1;
+    padding: 7px;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: 'DM Sans', sans-serif;
+    transition: opacity .15s;
+  }
+  .btn-primary:hover { opacity: .85; }
+  .btn-primary:disabled { opacity: .4; cursor: default; }
+
+  .btn-ghost {
+    padding: 7px 10px;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    cursor: pointer;
+    color: var(--text2);
+    font-family: 'DM Sans', sans-serif;
+    transition: background .1s;
+  }
+  .btn-ghost:hover { background: var(--surface2); }
+
+  /* ADD COLUMN */
+  .add-col-wrap { width: 220px; min-width: 220px; }
+
+  .add-col-btn {
+    width: 100%;
+    padding: 10px 14px;
+    background: none;
+    border: 1px dashed var(--border2);
+    border-radius: var(--radius);
+    font-size: 13px;
+    color: var(--text3);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-family: 'DM Sans', sans-serif;
+    white-space: nowrap;
+    transition: background .15s, color .15s;
+  }
+  .add-col-btn:hover { background: var(--surface); color: var(--text2); }
+
+  .add-col-form {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .add-col-form input {
+    font-size: 13px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--text);
+    outline: none;
+    font-family: 'DM Sans', sans-serif;
+    transition: border-color .15s;
+  }
+  .add-col-form input:focus { border-color: var(--border2); }
+
+  /* NEW BOARD FORM */
+  .new-board-input {
+    padding: 4px 10px;
+    font-size: 13px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface2);
+    color: var(--text);
+    outline: none;
+    font-family: 'DM Sans', sans-serif;
+    width: 130px;
+    height: 32px;
+  }
+  .new-board-input:focus { border-color: var(--border2); }
+
+  .btn-sm {
+    padding: 4px 12px;
+    height: 32px;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: 'DM Sans', sans-serif;
+  }
+
+  /* TAG COLORS */
+  .tag-slate  { background: #f0efe9; color: #5a5850; }
+  .tag-blue   { background: #e8f0fc; color: #2d5fa8; }
+  .tag-green  { background: #e6f4ec; color: #1e6e42; }
+  .tag-amber  { background: #fef3e2; color: #8a5e1a; }
+  .tag-red    { background: #fde8e8; color: #b94040; }
+  .tag-purple { background: #f0eafc; color: #6b3ea8; }
+
+  /* EMPTY STATE */
+  .empty-state {
+    text-align: center;
+    padding: 32px 20px;
+    color: var(--text3);
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  /* MODAL */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.3);
+    z-index: 200;
+    align-items: center;
+    justify-content: center;
+  }
+  .modal-overlay.open { display: flex; }
+
+  .modal {
+    background: var(--surface);
+    border-radius: var(--radius);
+    padding: 24px;
+    width: 380px;
+    max-width: 90vw;
+    box-shadow: var(--shadow-md);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    max-height: 90vh;
+    overflow-y: auto;
+  }
+
+  .modal h3 { font-size: 15px; font-weight: 500; }
+
+  .modal input,
+  .modal textarea,
+  .modal select {
+    width: 100%;
+    font-size: 13px;
+    padding: 8px 11px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface2);
+    color: var(--text);
+    outline: none;
+    resize: none;
+    font-family: 'DM Sans', sans-serif;
+  }
+  .modal input:focus,
+  .modal textarea:focus { border-color: var(--border2); }
+
+  .modal-row { display: flex; gap: 8px; }
+  .modal-label { font-size: 11px; color: var(--text2); font-weight: 500; margin-bottom: 4px; }
+
+  /* DATE */
+  .card-date {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-top: 7px;
+    font-size: 11px;
+    color: var(--text3);
+    font-family: 'DM Mono', monospace;
+  }
+  .card-date svg {
+    flex-shrink: 0;
+    opacity: .55;
+  }
+
+  .card-meta {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 7px;
+    flex-wrap: wrap;
+  }
+  .card-meta-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: var(--text3);
+    font-family: 'DM Mono', monospace;
+  }
+  .card-meta-item svg {
+    flex-shrink: 0;
+    opacity: .55;
+  }
+
+  .card-dates-block {
+    margin-top: 7px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 6px 9px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .card-dates-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 10px;
+    color: var(--text3);
+    font-family: 'DM Mono', monospace;
+  }
+  .card-dates-row svg { flex-shrink: 0; opacity: .5; }
+  .card-dates-label {
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--text3);
+    min-width: 68px;
+  }
+
+  .col._resgatado-col {
+    opacity: .75;
+    border-style: dashed;
+  }
+  .col._resgatado-col .col-name { color: var(--text3); }
+
+  /* HISTÓRICO */
+  .card-history {
+    margin-top: 8px;
+    border-top: 1px solid var(--border);
+    padding-top: 7px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .card-history-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    font-size: 10px;
+    color: var(--text3);
+    font-family: 'DM Mono', monospace;
+    line-height: 1.4;
+  }
+  .card-history-dot {
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: var(--border2);
+    margin-top: 4px;
+    flex-shrink: 0;
+  }
+  .card-history-dot.first { background: var(--text3); }
+  .card-history-label { color: var(--text2); font-size: 10px; }
+
+  .col-export-btn {
+    padding: 2px 9px;
+    height: 22px;
+    font-size: 11px;
+    font-family: 'DM Sans', sans-serif;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    opacity: 0;
+    transition: opacity .15s;
+    font-weight: 500;
+  }
+  .col:hover .col-export-btn { opacity: 1; }
+  .col-export-btn:hover { opacity: .85 !important; }
+
+  /* SCROLLBAR */
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 10px; }
+
+  /* TOGGLE ONSHORE/OFFSHORE */
+  .shore-toggle {
+    display: flex;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 3px;
+    gap: 3px;
+  }
+  .shore-btn {
+    flex: 1;
+    padding: 6px 0;
+    font-size: 12px;
+    font-weight: 500;
+    font-family: 'DM Sans', sans-serif;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    background: none;
+    color: var(--text3);
+    transition: background .15s, color .15s;
+  }
+  .shore-btn.active {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+  .shore-badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 20px;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    margin-left: 5px;
+    vertical-align: middle;
+  }
+  .shore-badge.onshore  { background: #e6f4ec; color: #1e6e42; }
+  .shore-badge.offshore { background: #e8f0fc; color: #2d5fa8; }
+
+  /* AUTOCOMPLETE CLIENTE */
+  .ac-wrap { position: relative; }
+  .ac-input {
+    width: 100%;
+    font-size: 12px;
+    padding: 6px 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface2);
+    color: var(--text);
+    outline: none;
+    font-family: 'DM Sans', sans-serif;
+    transition: border-color .15s;
+    box-sizing: border-box;
+  }
+  .ac-input:focus { border-color: var(--border2); background: var(--surface); }
+  .ac-list {
+    position: absolute;
+    top: 100%;
+    left: 0; right: 0;
+    background: var(--surface);
+    border: 1px solid var(--border2);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-md);
+    max-height: 180px;
+    overflow-y: auto;
+    z-index: 999;
+    display: none;
+  }
+  .ac-list.open { display: block; }
+  .ac-item {
+    padding: 6px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+  }
+  .ac-item:hover, .ac-item.active { background: var(--surface2); }
+</style>
+</head>
+<body>
+
+<!-- ══ LOGIN SCREEN ══ -->
+<div id="loginScreen" style="display:flex">
+  <div class="login-box">
+    <div>
+      <div class="login-logo">Kanban</div>
+      <div class="login-subtitle">Faça login para continuar</div>
+    </div>
+    <div>
+      <div class="login-label">E-mail</div>
+      <input id="loginEmail" class="login-input" type="email" placeholder="seu@email.com" onkeydown="loginKeydown(event)">
+    </div>
+    <div>
+      <div class="login-label">Senha</div>
+      <input id="loginPass" class="login-input" type="password" placeholder="••••••••" onkeydown="loginKeydown(event)">
+    </div>
+    <div id="loginError" class="login-error"></div>
+    <button id="loginBtn" class="login-btn" onclick="doLogin()">Entrar</button>
+  </div>
+</div>
+
+<!-- ══ APP SCREEN ══ -->
+<div id="appScreen" style="display:none">
+
+<!-- TOPBAR -->
+<div class="topbar">
+  <div class="topbar-logo">Kanban</div>
+  <div class="board-tabs" id="boardTabs"></div>
+  <div class="topbar-right">
+    <span style="font-size:11px;color:var(--text3);display:flex;align-items:center"><span class="sync-dot"></span>Sync</span>
+    <span id="posicoesBadge" style="display:none;font-size:11px;color:#1e6e42;background:#e6f4ec;border:1px solid #a8d9b8;border-radius:20px;padding:3px 10px;font-family:DM Mono,monospace;"></span>
+    <input type="file" id="posicoesInput" accept=".xlsx,.xls" style="display:none" onchange="uploadPosicoes(this)">
+    <button class="btn-icon" title="Upload base de posições (Excel)" onclick="document.getElementById('posicoesInput').click()">📊</button>
+    <span class="user-badge" id="userEmail"></span>
+    <button class="btn-icon" title="Sair" onclick="doLogout()">⎋</button>
+  </div>
+</div>
+
+<!-- BOARD -->
+<div class="board-wrap" id="boardWrap"></div>
+
+<!-- EDIT MODAL -->
+<div class="modal-overlay" id="editModal">
+  <div class="modal">
+    <h3>Editar card</h3>
+    <div class="shore-toggle">
+      <button class="shore-btn active" id="editShoreOnshore" onclick="setEditShore('onshore')">Onshore</button>
+      <button class="shore-btn" id="editShoreOffshore" onclick="setEditShore('offshore')">Offshore</button>
+    </div>
+    <div>
+      <div class="modal-label">Título</div>
+      <input id="editTitle" type="text" placeholder="Título do card">
+    </div>
+    <div>
+      <div class="modal-label">Descrição</div>
+      <textarea id="editDesc" rows="3" placeholder="Descrição (opcional)"></textarea>
+    </div>
+    <div>
+      <div class="modal-label">Etiqueta</div>
+      <select id="editTag">
+        <option value="slate">— sem etiqueta</option>
+        <option value="blue">🔵 Desenvolvimento</option>
+        <option value="green">🟢 Concluído</option>
+        <option value="amber">🟡 Em análise</option>
+        <option value="red">🔴 Bug / Urgente</option>
+        <option value="purple">🟣 Feature</option>
+      </select>
+    </div>
+    <div>
+      <div class="modal-label">Responsável</div>
+      <select id="editAuthor">
+        <option value="">— sem responsável</option>
+        <option>Juliana Paiva</option>
+        <option>Thiago Campos</option>
+        <option>Julia Setton</option>
+        <option>Leticia Costa</option>
+        <option>Alexandre Luz</option>
+        <option>Fernanda Valle</option>
+        <option>Arthur Mello</option>
+        <option>Claudia Salles</option>
+        <option>Tharcisio Santos</option>
+        <option>Ricardo Guimarães</option>
+      </select>
+    </div>
+    <div>
+      <div class="modal-label">Cliente</div>
+      <select id="editCliente">
+        <option value="">— selecione o cliente</option>
+        <option>T08 - ALM</option><option>T08 - FLM</option><option>T08 - LMA</option>
+        <option>T101 - DML</option><option>T101 - LML</option><option>T101 - MML</option>
+        <option>T129 - RS</option><option>T18 - DN</option><option>T18 - NBP</option>
+        <option>T18 - NWG</option><option>T1943 - GAPR</option><option>T1943 - GIPR</option>
+        <option>T1943 - PPR</option><option>T1943 - RPR</option><option>T2653 - EKT</option>
+        <option>T2653 - ETT</option><option>T2653 - LT</option><option>T2653 - MT</option>
+        <option>T2653 - PT</option><option>T2653 - HAN</option><option>T29 - DIF</option>
+        <option>T29 - JKF</option><option>T29 - JKSA</option><option>T501 - DML</option>
+        <option>T501 - JL</option><option>T501 - ML</option><option>T57 - ACF</option>
+        <option>T712 - RB</option><option>T7677 - CP</option><option>T7677 - SSM</option>
+        <option>T771 - ABO</option><option>T8484 - RDC</option><option>T858 - FC</option>
+        <option>T858 - VC</option><option>T8816 - LG</option><option>T8846 - AR</option>
+        <option>T8846 - ER</option>
+      </select>
+    </div>
+    <!-- CAMPOS ONSHORE -->
+    <div id="editOnshoreFields">
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <div>
+          <div class="modal-label">Tipo de operação</div>
+          <select id="editOperation" onchange="toggleEditValue()">
+            <option value="">— tipo de operação</option>
+            <option value="resgate_total">Resgate Total</option>
+            <option value="resgate_parcial">Resgate Parcial</option>
+            <option value="aplicacao">Aporte</option>
+          </select>
+        </div>
+        <div id="editValueWrap" style="display:none">
+          <div class="modal-label">Valor</div>
+          <div style="position:relative">
+            <span style="position:absolute;left:11px;top:50%;transform:translateY(-50%);font-size:13px;color:var(--text2);pointer-events:none">R$</span>
+            <input id="editValue" type="text" placeholder="0,00" style="padding-left:32px" oninput="formatValueInput(this)">
+          </div>
+        </div>
+        <div>
+          <div class="modal-label">Banco</div>
+          <select id="editBanco">
+            <option value="">— selecione o banco</option>
+            <option>XP INVESTIMENTOS</option>
+            <option>BANCO BTG PACTUAL</option>
+            <option>ITAÚ UNIBANCO</option>
+            <option>BRADESCO</option>
+            <option>SANTANDER</option>
+            <option>ICATU</option>
+            <option>BANCO DO BRASIL</option>
+            <option>UBS</option>
+            <option>BRL TRUST</option>
+          </select>
+        </div>
+        <div>
+          <div class="modal-label">Fundo</div>
+          <select id="editFundo" onchange="updateEditCnpj()">
+            <option value="">— selecione o fundo</option>
+            <option>TFO DIC FIC FIM CP</option>
+            <option>TFO RFC FIC FIM CP</option>
+            <option>BRADESCO PRIVATE PORTIFÓLIO RESP LIMITADA FI RF REFERENCIADO DI</option>
+            <option>ITAÚ PRIVATE WEALTH IQ REF DI FIC RF</option>
+            <option>ITAÚ PRIVATE WEALTH RESP LIMITADA FIF CIC RF REFERENCIADO FIC RF</option>
+            <option>BTG PACTUAL CDB I FIC RF CP</option>
+            <option>TREND PÓS-FIXADO FIC RF</option>
+            <option>GLOBAL CREDIT ALLOCATION V FIF EM COTAS DE FI MM</option>
+            <option>GLOBAL EQUITIES ALLOCATION V RESP LIMITADA FIC FIA FIC FIA</option>
+            <option>GLOBAL MACRO ALLOCATION VT FIC FIM FIC FIM CP</option>
+            <option>TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI</option>
+            <option>TORI AÇÕES RESP LIMITADA FIF FIA</option>
+            <option>TORI BP RESP LIMITADA FIF FIA</option>
+            <option>TORI DI DEB RESP LIMITADA FIF CIC INFRA RF FIC RF CP</option>
+            <option>TORI LD RESP LIMITADA FIF CIC RF FIC RF</option>
+            <option>TORI MM RESP LIMITADA FIC FIM CP</option>
+            <option>TORI NB RESP LIMITADA FIF CIC RF FIC RF</option>
+            <option>GLOBAL MACRO ALLOCATION V FIC FIM FIC FIM CP</option>
+            <option>TORI BL RESP LIMITADA FIF RF CIC RF</option>
+            <option>BRADESCO PRIVATE FIC RF REF. DI PORTIFÓLIO</option>
+            <option>ITAÚ PRIVATE WEALTH IQ REF DI FIC RF</option>
+            <option>ITAÚ PRIVATE WEALTH RESP LIMITADA FIF CIC RF REFERENCIADO FIC RF</option>
+            <option>BTG CDB</option>
+            <option>TREND PÓS-FIXADO FIC FIRF SIMPLES RL</option>
+            <option value="__outro__">Outro…</option>
+          </select>
+        </div>
+        <div id="editFundoOutroWrap" style="display:none">
+          <div class="modal-label">Nome do fundo (livre)</div>
+          <input id="editFundoOutro" type="text" placeholder="Digite o nome do fundo">
+        </div>
+        <div id="editCnpjWrap" style="display:none">
+          <div class="modal-label">CNPJ</div>
+          <div style="position:relative">
+            <input id="editCnpj" type="text" readonly style="background:var(--surface2);color:var(--text3);cursor:default;font-family:'DM Mono',monospace;font-size:12px;">
+          </div>
+        </div>
+        <div id="editDatesWrap" style="display:none;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;flex-direction:column;gap:6px;">
+          <div class="modal-label" style="margin-bottom:2px">Datas de resgate</div>
+          <div style="display:flex;gap:16px;flex-wrap:wrap;">
+            <div><div class="modal-label">Cotização</div><input id="editCotDate" type="text" readonly style="background:var(--surface);color:var(--text2);cursor:default;font-family:'DM Mono',monospace;font-size:12px;width:110px;"></div>
+            <div><div class="modal-label">Liquidação</div><input id="editLiqDate" type="text" readonly style="background:var(--surface);color:var(--text2);cursor:default;font-family:'DM Mono',monospace;font-size:12px;width:110px;"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- CAMPOS OFFSHORE -->
+    <div id="editOffshoreFields" style="display:none">
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <div>
+          <div class="modal-label">Fundo</div>
+          <select id="editFundoOffshore">
+            <option value="">— selecione o fundo</option>
+            <option>TFO MILANO SPC - TFO UNCORRELATED SP</option>
+            <option>TFO MILANO SPC - TFO CREDIT FUND SP</option>
+            <option>TFO MILANO SPC - TFO EQUITY LONG ONLY FUND SP</option>
+            <option>TBP SPC - TBP 3 SP</option>
+            <option>TFO MARE SPC - TFO DM CREDIT FUND SP</option>
+            <option value="__outro__">Outro…</option>
+          </select>
+        </div>
+        <div id="editFundoOffshoreOutroWrap" style="display:none">
+          <div class="modal-label">Nome do fundo (livre)</div>
+          <input id="editFundoOffshoreOutro" type="text" placeholder="Digite o nome do fundo">
+        </div>
+        <div>
+          <div class="modal-label">Tipo de operação</div>
+          <select id="editOperationOffshore">
+            <option value="">— tipo de operação</option>
+            <option value="resgate_total">Resgate Total</option>
+            <option value="resgate_parcial">Resgate Parcial</option>
+            <option value="aplicacao">Aporte</option>
+          </select>
+        </div>
+        <div id="editValueOffshoreWrap" style="display:none">
+          <div class="modal-label">Valor (USD)</div>
+          <div style="position:relative">
+            <span style="position:absolute;left:11px;top:50%;transform:translateY(-50%);font-size:13px;color:var(--text2);pointer-events:none">USD</span>
+            <input id="editValueOffshore" type="text" placeholder="0,00" style="padding-left:48px" oninput="formatValueInput(this)">
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-row">
+      <button class="btn-primary" onclick="saveEdit()">Salvar</button>
+      <button class="btn-ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn-ghost" style="color:#b94040;margin-left:auto" onclick="deleteFromModal()">Excluir</button>
+    </div>
+  </div>
+</div>
+
+</div><!-- /appScreen -->
+
+<script>
+const TAG_LABELS = {
+  slate: '', blue: 'Dev', green: 'Concluído',
+  amber: 'Em análise', red: 'Urgente', purple: 'Feature'
+};
+
+const FUNDOS_OFFSHORE = [
+  'TFO MILANO SPC - TFO UNCORRELATED SP',
+  'TFO MILANO SPC - TFO CREDIT FUND SP',
+  'TFO MILANO SPC - TFO EQUITY LONG ONLY FUND SP',
+  'TBP SPC - TBP 3 SP',
+  'TFO MARE SPC - TFO DM CREDIT FUND SP',
+];
+
+const FUNDOS_INFO = {
+  'TFO DIC FIC FIM CP':                                              { cnpj: '51.691.876/0001-62', cot: 0,   liq: 0 },
+  'TFO RFC FIC FIM CP':                                              { cnpj: '27.292.904/0001-94', cot: 0,   liq: 0 },
+  'BRADESCO PRIVATE PORTIFÓLIO RESP LIMITADA FI RF REFERENCIADO DI': { cnpj: '05.513.332/0001-93', cot: 0,   liq: 0 },
+  'ITAÚ PRIVATE WEALTH IQ REF DI FIC RF':                           { cnpj: '29.152.383/0001-03', cot: 0,   liq: 0 },
+  'ITAÚ PRIVATE WEALTH RESP LIMITADA FIF CIC RF REFERENCIADO FIC RF':{ cnpj: '26.199.425/0001-65', cot: 0,   liq: 0 },
+  'BTG PACTUAL CDB I FIC RF CP':                                     { cnpj: '16.565.016/0001-81', cot: 0,   liq: 0 },
+  'TREND PÓS-FIXADO FIC RF':                                         { cnpj: '26.559.284/0001-44', cot: 0,   liq: 0 },
+  'GLOBAL CREDIT ALLOCATION V FIF EM COTAS DE FI MM':                { cnpj: '47.102.539/0001-15', cot: 90,  liq: 1 },
+  'GLOBAL EQUITIES ALLOCATION V RESP LIMITADA FIC FIA FIC FIA':      { cnpj: '52.196.245/0001-30', cot: 62,  liq: 2 },
+  'GLOBAL MACRO ALLOCATION VT FIC FIM FIC FIM CP':                   { cnpj: '51.139.770/0001-50', cot: 62,  liq: 1 },
+  'TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI':                  { cnpj: '64.347.179/0001-30', cot: 180, liq: 1 },
+  'TORI AÇÕES RESP LIMITADA FIF FIA':                                { cnpj: '61.647.986/0001-80', cot: 60,  liq: 2 },
+  'TORI BP RESP LIMITADA FIF FIA':                                   { cnpj: '61.648.430/0001-09', cot: 60,  liq: 2 },
+  'TORI DI DEB RESP LIMITADA FIF CIC INFRA RF FIC RF CP':            { cnpj: '61.650.068/0001-00', cot: 30,  liq: 1 },
+  'TORI LD RESP LIMITADA FIF CIC RF FIC RF':                         { cnpj: '61.649.458/0001-60', cot: 0,   liq: 1 },
+  'TORI MM RESP LIMITADA FIC FIM CP':                                { cnpj: '61.650.367/0001-45', cot: 60,  liq: 1 },
+  'TORI NB RESP LIMITADA FIF CIC RF FIC RF':                         { cnpj: '61.650.641/0001-86', cot: 0,   liq: 1 },
+  'GLOBAL MACRO ALLOCATION V FIC FIM FIC FIM CP':                    { cnpj: '47.443.954/0001-32', cot: 62,  liq: 1 },
+  'TORI BL RESP LIMITADA FIF RF CIC RF':                             { cnpj: '63.230.065/0001-43', cot: 0,   liq: 1 },
+};
+const FUNDOS = Object.fromEntries(Object.entries(FUNDOS_INFO).map(([k,v]) => [k, v.cnpj]));
+
+const CLIENTES = ['T08 - ALM','T08 - FLM','T08 - LMA','T101 - DML','T101 - LML','T101 - MML','T129 - RS','T18 - DN','T18 - NBP','T18 - NWG','T1943 - GAPR','T1943 - GIPR','T1943 - PPR','T1943 - RPR','T2653 - EKT','T2653 - ETT','T2653 - LT','T2653 - MT','T2653 - PT','T2653 - HAN','T29 - DIF','T29 - JKF','T29 - JKSA','T501 - DML','T501 - JL','T501 - ML','T57 - ACF','T712 - RB','T7677 - CP','T7677 - SSM','T771 - ABO','T8484 - RDC','T858 - FC','T858 - VC','T8816 - LG','T8846 - AR','T8846 - ER','T98 - CONSULTORIA','T98 - LEGADO'];
+
+/* ── FERIADOS E DATAS ── */
+function getEaster(year) {
+  const a = year % 19, b = Math.floor(year / 100), c = year % 100;
+  const d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3), h = (19*a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4), k = c % 4;
+  const l = (32 + 2*e + 2*i - h - k) % 7;
+  const m = Math.floor((a + 11*h + 22*l) / 451);
+  const month = Math.floor((h + l - 7*m + 114) / 31);
+  const day   = ((h + l - 7*m + 114) % 31) + 1;
+  return new Date(year, month - 1, day);
+}
+
+function getHolidays(year) {
+  const easter = getEaster(year);
+  const add = (d, days) => { const r = new Date(d); r.setDate(r.getDate() + days); return r; };
+  const fmt  = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const fixed = [
+    `${year}-01-01`, `${year}-04-21`, `${year}-05-01`,
+    `${year}-09-07`, `${year}-10-12`, `${year}-11-02`,
+    `${year}-11-15`, `${year}-11-20`, `${year}-12-25`
+  ];
+  const mobile = [
+    fmt(add(easter, -48)),
+    fmt(add(easter, -47)),
+    fmt(add(easter, -2)),
+    fmt(easter),
+    fmt(add(easter, 60))
+  ];
+  return new Set([...fixed, ...mobile]);
+}
+
+function isBusinessDay(date) {
+  const dow = date.getDay();
+  if (dow === 0 || dow === 6) return false;
+  const holidays = getHolidays(date.getFullYear());
+  const key = `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;
+  return !holidays.has(key);
+}
+
+function addCalendarDays(date, days) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+function addBusinessDays(date, days) {
+  if (days === 0) return new Date(date);
+  let d = new Date(date);
+  let added = 0;
+  while (added < days) {
+    d.setDate(d.getDate() + 1);
+    if (isBusinessDay(d)) added++;
+  }
+  return d;
+}
+
+function calcDates(fromDateStr, fundo) {
+  if (!fundo || !FUNDOS_INFO[fundo]) return null;
+  const info = FUNDOS_INFO[fundo];
+  const parts = fromDateStr.split('/');
+  const base = new Date(parseInt(parts[2]), parseInt(parts[1])-1, parseInt(parts[0]));
+  const cotDate = addCalendarDays(base, info.cot);
+  const liqDate = addBusinessDays(cotDate, info.liq);
+  const fmt = d => d.toLocaleDateString('pt-BR');
+  return { cotDate: fmt(cotDate), liqDate: fmt(liqDate) };
+}
+
+const POSICOES_BASE = {"T08 - ALM": [{"produto": "CAIXA", "banco": "SANTANDER"}, {"produto": "CAIXA", "banco": "XP INVESTIMENTOS"}, {"produto": "NTN-B 08/2028", "banco": "XP INVESTIMENTOS"}, {"produto": "TFO DIC FIC FIM CP", "banco": "SANTANDER"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "XP INVESTIMENTOS"}, {"produto": "TREND PÓS-FIXADO FIC RF", "banco": "XP INVESTIMENTOS"}], "T08 - FLM": [{"produto": "CAIXA", "banco": "SANTANDER"}, {"produto": "CAIXA", "banco": "XP INVESTIMENTOS"}, {"produto": "CRA SÃO MARTIN 98,5 % CDI 12/04/2028 2ª S 198ª E (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "LCI CEF 92 % CDI 09/11/2026 (08/11/2024)", "banco": "XP INVESTIMENTOS"}, {"produto": "LCI CEF 92,5 % CDI 03/02/2027 (03/02/2025)", "banco": "XP INVESTIMENTOS"}, {"produto": "LCI CEF 96,5 % CDI 30/04/2027 (30/04/2027)", "banco": "XP INVESTIMENTOS"}, {"produto": "TORI LD RESP LIMITADA FIF CIC RF FIC RF", "banco": "XP INVESTIMENTOS"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "XP INVESTIMENTOS"}, {"produto": "TREND DI SIMPLES FIC RF", "banco": "XP INVESTIMENTOS"}, {"produto": "TREND PÓS-FIXADO FIC RF", "banco": "XP INVESTIMENTOS"}], "T08 - LMA": [{"produto": "CAIXA", "banco": "SANTANDER"}, {"produto": "CAIXA", "banco": "XP INVESTIMENTOS"}, {"produto": "TFO DIC FIC FIM CP", "banco": "SANTANDER"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "SANTANDER"}, {"produto": "TORI LD RESP LIMITADA FIF CIC RF FIC RF", "banco": "SANTANDER"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "SANTANDER"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "SANTANDER"}], "T101 - DML": [{"produto": "BTG PACTUAL DIGITAL TESOURO SELIC FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB BTG PACTUAL 100 % CDI 10/05/2027 III", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB BTG PACTUAL 100 % CDI 10/05/2027 VI", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB BTG PACTUAL 100 % CDI 12/04/2027 III", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB BTG PACTUAL 100 % CDI 15/03/2027 II", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB BTG PACTUAL 100 % CDI 17/05/2027", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB BTG PACTUAL 100 % CDI 25/03/2027 III", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB BTG PACTUAL 100 % CDI 31/03/2027 III", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "BRADESCO"}, {"produto": "TFO PREV MMI ICATU PREV FIM", "banco": "BRADESCO"}], "T101 - LML": [{"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL DIGITAL TESOURO SELIC FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL TESOURO SELIC REFERENCIADO FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 14/05/2027 IV", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 15/02/2028 II", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 16/09/2027 V", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 18/05/2027 III", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 22/06/2027 VII", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 30/04/2027 IV", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 31/05/2027 VIII", "banco": "SANTANDER"}, {"produto": "CRA MNRV CDI + 1,1 % 15/03/2029 1ª S 197ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRI VOTORANTIM CIMENTOS S.A. IPCA + 4,4657 % 15/02/2033 325ª S 1ª E I", "banco": "BANCO BTG PACTUAL"}, {"produto": "PORTFÓLIO BALANCEADO CLASSE DE INVESTIMENTO EM AÇÕES - RESP LTDA", "banco": "SANTANDER"}, {"produto": "TFO DI DEB CIC DE CLASSE DE INVESTIMENTO RF INCENTIVADO EM INFRA - RESP LTDA", "banco": "SANTANDER"}, {"produto": "TFO INFRA CIC DE CLASSE DE INVESTIMENTO RF INCENTIVADO EM INFRA - RESP LTDA", "banco": "SANTANDER"}, {"produto": "TFO MM CIC DE CLASSES DE INVESTIMENTO MULTI CP - RESP LTDA", "banco": "SANTANDER"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "ICATU"}, {"produto": "TFO PREV MMI ICATU PREV FIM", "banco": "ICATU"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}], "T101 - MML": [{"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "BRADESCO"}], "T129 - RS": [{"produto": "CAIXA", "banco": "ITAÚ UNIBANCO"}, {"produto": "CAIXA", "banco": "XP INVESTIMENTOS"}, {"produto": "CDB ITAÚ 100 % CDI 11/11/2030 I", "banco": "ITAÚ UNIBANCO"}, {"produto": "CDCA BTG PACTUAL PRÉ 11,87% 15/07/2031 (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "CRA VERT COMPANHIA SECURITIZADORA CDI + 2,55 % 26/11/2026 1ª S 91ª E (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "CRI BROOKFIELD CDI + 1,7 % 19/04/2027 400ª S 1ª E", "banco": "XP INVESTIMENTOS"}, {"produto": "CRI ROSEWOOD IPCA + 7,04 % 22/11/2033 486ª S 1ª E (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "CRI TRUE SECURITIZADORA S.A IPCA + 7,9 % 17/09/2043 1ª S 113ª E (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "DEBÊNTURE RISP12 IPCA + 6,9 % 15/01/2034", "banco": "XP INVESTIMENTOS"}, {"produto": "GOLD11", "banco": "XP INVESTIMENTOS"}, {"produto": "HASHDEX BITCOIN FIC FIM", "banco": "XP INVESTIMENTOS"}, {"produto": "ITAÚ ABSOLUTE VERTEX PREV I RESP LIMITADA FIC FIM", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ FLEXPREV OPTIMUS FIC RF LP", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ FLEXPREV PRIVATE JURO REAL TARGET 2035 II FIF CIC RENDA FIXA - RESP LIMITADA", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ PRIVATE WEALTH IQ REF DI FIC RF", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ PRIVILEGE REFERENCIADO FIC RF", "banco": "ITAÚ UNIBANCO"}, {"produto": "KNIP11", "banco": "XP INVESTIMENTOS"}, {"produto": "LCI CEF 90 % CDI 09/11/2026 I", "banco": "XP INVESTIMENTOS"}, {"produto": "LCI CEF 90 % CDI 18/11/2026", "banco": "XP INVESTIMENTOS"}, {"produto": "NTN-B 08/2032", "banco": "XP INVESTIMENTOS"}, {"produto": "TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI", "banco": "XP INVESTIMENTOS"}, {"produto": "TFO INFRA CIC DE CLASSE DE INVESTIMENTO RF INCENTIVADO EM INFRA - RESP LTDA", "banco": "XP INVESTIMENTOS"}, {"produto": "TFO PREV MMI ICATU PREV FIM", "banco": "BRADESCO"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "XP INVESTIMENTOS"}, {"produto": "TORI DI DEB RESP LIMITADA FIF CIC INFRA RF FIC RF CP", "banco": "XP INVESTIMENTOS"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "XP INVESTIMENTOS"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "XP INVESTIMENTOS"}, {"produto": "VBI PRIME PROPERTIES FII", "banco": "XP INVESTIMENTOS"}, {"produto": "WHG GLOBAL LB BRL FIC FIA", "banco": "XP INVESTIMENTOS"}, {"produto": "WHGR11", "banco": "XP INVESTIMENTOS"}, {"produto": "XP ICATU HORIZONTE PREV RESP LIMITADA FIC RF", "banco": "XP INVESTIMENTOS"}, {"produto": "XP MALLS FII", "banco": "XP INVESTIMENTOS"}, {"produto": "TREND PÓS-FIXADO FIC RF", "banco": "XP INVESTIMENTOS"}], "T13 - CFC": [{"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}], "T16 - RTC": [{"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}], "T16 - RTC CONSOLIDAÇÃO": [{"produto": "NEO FUTURE FIC FIA", "banco": ""}], "T18 - DN": [{"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL TESOURO SELIC REFERENCIADO FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "GLOBAL CREDIT ALLOCATION V FIF EM COTAS DE FI MM", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI BP RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}], "T18 - NBP": [{"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB BTG PACTUAL 100 % CDI 14/01/2028 I", "banco": "BANCO BTG PACTUAL"}, {"produto": "GLOBAL CREDIT ALLOCATION V FIF EM COTAS DE FI MM", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO SICURO FIF CIC RF - SUBCLASSE SPECIAL SITS FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO SPECIAL SITS FIF - SUBCLASSE TORI FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI BP RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI DI DEB RESP LIMITADA FIF CIC INFRA RF FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI LD RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}], "T18 - NWG": [{"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "COMPROMISSADA BTG PACTUAL 85 % CDI 11/08/2026", "banco": "BANCO BTG PACTUAL"}], "T1943 - GAPR": [{"produto": "BRADESCO SKY FI RF DI", "banco": "XP INVESTIMENTOS"}, {"produto": "CAIXA", "banco": "XP INVESTIMENTOS"}, {"produto": "COE XP IPCA + 9,14 % 12/02/2031 (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "COSENZA CAPITAL INVESTIMENTO FI MM CRÉD PRIV", "banco": "XP INVESTIMENTOS"}, {"produto": "DEBÊNTURE AGRU12 IPCA + 14,88 % 15/10/2026 (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "DEBÊNTURE CBRDA8   CDI + 1,7 % 10/05/2026", "banco": "XP INVESTIMENTOS"}, {"produto": "FND CREDITAS CDI + 3 % 15/10/2027 (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "IRIDIUM PIONEER INFRA FI RF", "banco": "XP INVESTIMENTOS"}, {"produto": "ITUB4", "banco": "XP INVESTIMENTOS"}, {"produto": "MAPFRE CONFIANZA FIF RF REF DI CRÉD PRIV - RESP LIMITADA", "banco": "XP INVESTIMENTOS"}, {"produto": "SOLIS CAPITAL ANTARES ADVISORY FICFIDC (UNICA)", "banco": "XP INVESTIMENTOS"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "XP INVESTIMENTOS"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "XP INVESTIMENTOS"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "XP INVESTIMENTOS"}, {"produto": "TREND PÓS-FIXADO FIC RF", "banco": "XP INVESTIMENTOS"}, {"produto": "XP REFERENCIADO RF DI FI RF CP", "banco": "XP INVESTIMENTOS"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "BRADESCO"}], "T1943 - GIPR": [{"produto": "ALASKA INSTITUCIONAL LONG ONLY FIA", "banco": "XP INVESTIMENTOS"}, {"produto": "AZ QUEST VALORE FUNDO DE INVESTIMENTO RENDA FIXA CRÉDITO PRIVADO", "banco": "XP INVESTIMENTOS"}, {"produto": "CAIXA", "banco": "XP INVESTIMENTOS"}, {"produto": "CDB BANCO BMG S.A. PRÉ 9,25% 01/06/2026", "banco": "XP INVESTIMENTOS"}, {"produto": "CDB PICPAY BANK PRÉ 14,31% 31/10/2028", "banco": "XP INVESTIMENTOS"}, {"produto": "CDB WILL FINANCEIRA PRÉ 12,8% 30/10/2026", "banco": "XP INVESTIMENTOS"}, {"produto": "COSENZA CAPITAL INVESTIMENTO FI MM CRÉD PRIV", "banco": "XP INVESTIMENTOS"}, {"produto": "CRA ENGELHART PRÉ 11,96% 15/09/2033 4ª S 106ª E (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "CRA MNRV PRÉ 14,25% 16/09/2030 4ª S 179ª E (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "CRA RESA IPCA + 6,5885 % 16/08/2032 1ª S 38ª E (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "DAHLIA TOTAL RETURN ADVISORY FIM", "banco": "XP INVESTIMENTOS"}, {"produto": "DEBÊNTURE AGRU12 IPCA + 10,94 % 15/10/2026 (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "DEBÊNTURE RESA15 IPCA + 3,95 % 15/06/2030", "banco": "XP INVESTIMENTOS"}, {"produto": "GAMA BRIDGEWATER GLOBAL RISK PREMIUM USD FIC FIM IE", "banco": "XP INVESTIMENTOS"}, {"produto": "HASHDEX 100 NASDAQ CRYPTO INDEX FIM", "banco": "XP INVESTIMENTOS"}, {"produto": "NTN-B 05/2035", "banco": "XP INVESTIMENTOS"}, {"produto": "NTN-B 08/2040", "banco": "XP INVESTIMENTOS"}, {"produto": "NTN-F PRÉ 11,57% 01/01/2029", "banco": "XP INVESTIMENTOS"}, {"produto": "NTN-F PRÉ 11,59% 01/01/2035", "banco": "XP INVESTIMENTOS"}, {"produto": "OAKTREE GLOBAL CREDIT BRL FIC FIM FIC FIM CP", "banco": "XP INVESTIMENTOS"}, {"produto": "OASIS MM CRÉD PRIV FIC CP", "banco": "XP INVESTIMENTOS"}, {"produto": "SULAMÉRICA EXCELLENCE FI RF CP", "banco": "XP INVESTIMENTOS"}, {"produto": "TREND PÓS-FIXADO FIC RF", "banco": "XP INVESTIMENTOS"}, {"produto": "VALORA GUARDIAN ADVISORY FI EM COTAS DE FUNDOS DE INVESTIMENTO MULTIMERCADO CRÉDITO PRIVADO", "banco": "XP INVESTIMENTOS"}, {"produto": "XP INVESTOR EQUITY HEDGE FIC FIM", "banco": "XP INVESTIMENTOS"}, {"produto": "XP INVESTOR LONG BIASED 30 FICFIF MM - RESP LIMITADA", "banco": "XP INVESTIMENTOS"}, {"produto": "XP SPECIAL SITUATIONS FIC FIM CP IE", "banco": "XP INVESTIMENTOS"}, {"produto": "GOLD11", "banco": "XP INVESTIMENTOS"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "XP INVESTIMENTOS"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "XP INVESTIMENTOS"}], "T1943 - PPR": [{"produto": "CAIXA", "banco": "XP INVESTIMENTOS"}, {"produto": "COSENZA CAPITAL INVESTIMENTO FI MM CRÉD PRIV", "banco": "XP INVESTIMENTOS"}, {"produto": "FIDC CONSIGNADO INSS SENIOR CDI + 2 % 15/03/2030", "banco": "XP INVESTIMENTOS"}, {"produto": "HEADLINE XP VENTURE CAPITAL 3 MULTI - CLASSE A FIM FIP", "banco": "XP INVESTIMENTOS"}, {"produto": "TREND PE V FIC RF SIMPLES", "banco": "XP INVESTIMENTOS"}, {"produto": "TREND PE X RESP LIMITADA SIMPLES FIC RF", "banco": "XP INVESTIMENTOS"}, {"produto": "TREND PÓS-FIXADO FIC RF", "banco": "XP INVESTIMENTOS"}, {"produto": "XP SELECTION ALTERNATIVO FIP MULTIESTRATÉGIA", "banco": "XP INVESTIMENTOS"}], "T1943 - RPR": [{"produto": "AZ QUEST LUCE ADVISORY PREV XP SEGUROS FIC RF CRÉD PRIV RESP LIMITADA", "banco": "XP INVESTIMENTOS"}, {"produto": "CAIXA", "banco": "XP INVESTIMENTOS"}, {"produto": "COSENZA CAPITAL INVESTIMENTO FI MM CRÉD PRIV", "banco": "XP INVESTIMENTOS"}, {"produto": "DEBÊNTURE AGRU12 IPCA + 14,88 % 15/10/2026 (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "HEADLINE XP VENTURE CAPITAL 3 MULTI - CLASSE A FIM FIP", "banco": "XP INVESTIMENTOS"}, {"produto": "NTN-B 05/2035", "banco": "XP INVESTIMENTOS"}, {"produto": "NTN-B 08/2050", "banco": "XP INVESTIMENTOS"}, {"produto": "PORTO SEGURO RF REFERENCIADO DI FI RF CP", "banco": "XP INVESTIMENTOS"}, {"produto": "SPARTA PREV INFLAÇÃO ADVISORY XP SEGUROS FIC RF CP RESP LIMITADA", "banco": "XP INVESTIMENTOS"}, {"produto": "STARBOARD SPECIAL SITUATIONS II ADVISORY FIC FIM CP", "banco": "XP INVESTIMENTOS"}, {"produto": "SULAMÉRICA CRÉDITO ESG XP SEG PREV FIF DA CIC RF CRÉD PRIV IS RESP LIMITADA", "banco": "XP INVESTIMENTOS"}, {"produto": "SULAMÉRICA PRESTIGE XP SEG PREV FIF RF RESP LIMITADA", "banco": "XP INVESTIMENTOS"}, {"produto": "TREND PE X RESP LIMITADA SIMPLES FIC RF", "banco": "XP INVESTIMENTOS"}, {"produto": "XP INFRA IV INFRAESTRUTURA FIP", "banco": "XP INVESTIMENTOS"}], "T2024 - LPP": [{"produto": "TREND PÓS-FIXADO FIC RF", "banco": "XP INVESTIMENTOS"}], "T2653 - EKT": [{"produto": "BOVA11", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL DIGITAL TESOURO SELIC FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL TESOURO SELIC REFERENCIADO FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA VAMOS S.A. PRÉ 7,6% 16/11/2026 3ª S 23ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRI ILUMISOL DFR ADMINISTRADORA DE BENS IPCA + 6,69 % 15/08/2029 1ª S 31ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "DEBÊNTURE MOVI28 IPCA + 8,3368 % 15/06/2032", "banco": "BANCO BTG PACTUAL"}, {"produto": "KNUQ11", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF BRADESCO IPCA + 5,36 % 13/08/2031 (S/L) I", "banco": "BANCO BTG PACTUAL"}, {"produto": "PORTFÓLIO BALANCEADO CLASSE DE INVESTIMENTO EM AÇÕES - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "RDOR3", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO DI DEB CIC DE CLASSE DE INVESTIMENTO RF INCENTIVADO EM INFRA - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO DIC FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO MM CIC DE CLASSES DE INVESTIMENTO MULTI CP - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TNB INSTITUCIONAL INFLAÇÃO CURTA ATIVA CIC DE CLASSES DE INVESTIMENTO RF - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI LD RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}], "T2653 - ETT": [{"produto": "BOVA11", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL DIGITAL TESOURO SELIC FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL TESOURO SELIC REFERENCIADO FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB BTG PACTUAL 100 % CDI 23/02/2028", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA BRF CDI + 0,8 % 15/06/2029 1ª S 332ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA MNRV CDI + 1,1 % 15/03/2029 1ª S 197ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA SÃO MARTIN 99,9 % CDI 12/04/2029 3ª S 198ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA VAMOS S.A. PRÉ 7,6% 16/11/2026 3ª S 23ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRI ILUMISOL DFR ADMINISTRADORA DE BENS IPCA + 6,69 % 15/08/2029 1ª S 31ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "DEBÊNTURE AMERF2 128 % CDI 26/07/2029 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "DEBÊNTURE MOVI28 IPCA + 8,3368 % 15/06/2032", "banco": "BANCO BTG PACTUAL"}, {"produto": "DEBÊNTURE VAMO34 IPCA + 7,6897 % 15/10/2031 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "KNUQ11", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF BRADESCO IPCA + 5,36 % 13/05/2031 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "LFSN SAFRA PRÉ 10,27% 08/03/2029 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "PORTFÓLIO BALANCEADO CLASSE DE INVESTIMENTO EM AÇÕES - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "RDOR3", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO DI DEB CIC DE CLASSE DE INVESTIMENTO RF INCENTIVADO EM INFRA - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO DIC FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO MM CIC DE CLASSES DE INVESTIMENTO MULTI CP - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "BRADESCO"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI LD RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}], "T2653 - LT": [{"produto": "BOVA11", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL DIGITAL TESOURO SELIC FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL TESOURO SELIC REFERENCIADO FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA VAMOS S.A. PRÉ 7,6% 16/11/2026 3ª S 23ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRI ILUMISOL DFR ADMINISTRADORA DE BENS IPCA + 6,69 % 15/08/2029 1ª S 31ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "DEBÊNTURE MOVI28 IPCA + 8,3368 % 15/06/2032", "banco": "BANCO BTG PACTUAL"}, {"produto": "KNUQ11", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF BRADESCO IPCA + 5,36 % 13/08/2031 (S/L) III", "banco": "BANCO BTG PACTUAL"}, {"produto": "PORTFÓLIO BALANCEADO CLASSE DE INVESTIMENTO EM AÇÕES - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "RDOR3", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO DI DEB CIC DE CLASSE DE INVESTIMENTO RF INCENTIVADO EM INFRA - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO DIC FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO MM CIC DE CLASSES DE INVESTIMENTO MULTI CP - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TNB INSTITUCIONAL INFLAÇÃO CURTA ATIVA CIC DE CLASSES DE INVESTIMENTO RF - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI LD RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}], "T2653 - MT": [{"produto": "BOVA11", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL DIGITAL TESOURO SELIC FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL TESOURO SELIC REFERENCIADO FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA VAMOS S.A. PRÉ 7,6% 16/11/2026 3ª S 23ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRI ILUMISOL DFR ADMINISTRADORA DE BENS IPCA + 6,69 % 15/08/2029 1ª S 31ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "DEBÊNTURE MOVI28 IPCA + 8,3368 % 15/06/2032", "banco": "BANCO BTG PACTUAL"}, {"produto": "KNUQ11", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF BRADESCO IPCA + 5,36 % 13/08/2031 (S/L) IV", "banco": "BANCO BTG PACTUAL"}, {"produto": "PORTFÓLIO BALANCEADO CLASSE DE INVESTIMENTO EM AÇÕES - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "RDOR3", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO DI DEB CIC DE CLASSE DE INVESTIMENTO RF INCENTIVADO EM INFRA - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO DIC FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO MM CIC DE CLASSES DE INVESTIMENTO MULTI CP - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TNB INSTITUCIONAL INFLAÇÃO CURTA ATIVA CIC DE CLASSES DE INVESTIMENTO RF - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI LD RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}], "T2653 - PT": [{"produto": "BOVA11", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL DIGITAL TESOURO SELIC FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL TESOURO SELIC REFERENCIADO FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA VAMOS S.A. PRÉ 7,6% 16/11/2026 3ª S 23ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRI ILUMISOL DFR ADMINISTRADORA DE BENS IPCA + 6,69 % 15/08/2029 1ª S 31ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "DEBÊNTURE MOVI28 IPCA + 8,3368 % 15/06/2032", "banco": "BANCO BTG PACTUAL"}, {"produto": "KNUQ11", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF BRADESCO IPCA + 5,36 % 13/08/2031 (S/L) IV", "banco": "BANCO BTG PACTUAL"}, {"produto": "PORTFÓLIO BALANCEADO CLASSE DE INVESTIMENTO EM AÇÕES - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "RDOR3", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO DI DEB CIC DE CLASSE DE INVESTIMENTO RF INCENTIVADO EM INFRA - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO DIC FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO MM CIC DE CLASSES DE INVESTIMENTO MULTI CP - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TNB INSTITUCIONAL INFLAÇÃO CURTA ATIVA CIC DE CLASSES DE INVESTIMENTO RF - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI LD RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}], "T2653 - ST": [{"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "BANCO BTG PACTUAL"}], "T29 - DIF": [{"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB BTG PACTUAL 100 % CDI 25/02/2027 III", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF SAFRA IPCA + 4,63 % 17/08/2026 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF SAFRA IPCA + 5,94 % 20/04/2026 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF SAFRA IPCA + 6,18 % 02/09/2026 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF SAFRA PRÉ 11,11% 04/05/2026 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO MM1 CIC DE CLASSES DE INVESTIMENTO MULTI CP - RESP LTDA", "banco": "BANCO BTG PACTUAL"}], "T29 - JKF": [{"produto": "ABSOLUTE VERTEX PVT MM FIF DA CIC", "banco": "ITAÚ UNIBANCO"}, {"produto": "ABSOLUTO PARTNERS 2 PVT FIF DA CIC EM AÇÕES RESP LIMITADA", "banco": "ITAÚ UNIBANCO"}, {"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRA DEXCO S.A. IPCA + 6,44 % 17/10/2033 1ª S 1ª E", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRA IPIRANGA PRODUTOS DE PETRÓLEO S.A. IPCA + 6,0053 % 15/06/2032 1ª S 72ª E", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRA SLC IPCA + 6,75 % 15/07/2031 1ª S 1ª E", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRI BROOKFIELD CDI + 1 % 19/07/2027 1ª S 1ª E", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRI MRV IPCA + 6,5954 % 15/02/2029 442ª S 4ª E", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRI SÃO CARLOS IPCA + 7,3826 % 17/09/2029 1ª S 50ª E", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE ENEV15 IPCA + 5,5 % 15/06/2030", "banco": "ITAÚ UNIBANCO"}, {"produto": "HASHDEX BITCOIN FIC FIM", "banco": "BANCO BTG PACTUAL"}, {"produto": "IBIUNA EQUITIES 30 SELEÇÃO FIF DA CIC EM AÇÕES RESP LIMITADA", "banco": "ITAÚ UNIBANCO"}, {"produto": "IBIUNA HEDGE STR PVT FIC FIM", "banco": "ITAÚ UNIBANCO"}, {"produto": "IBIUNA LONG SHORT STLS SELEÇÃO MM FIF DA CIC RESP LIMITADA", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ PRIVATE WEALTH IQ REF DI FIC RF", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ SINFONIA FIC FIM CP", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITUB4", "banco": "ITAÚ UNIBANCO"}, {"produto": "KAPITALO K10 SELEÇÃO FIC FIM", "banco": "ITAÚ UNIBANCO"}, {"produto": "KAPITALO ZETA MERÍDIA PVT FIF DA CIC MM RESP LIMITADA", "banco": "ITAÚ UNIBANCO"}, {"produto": "KNUQ11", "banco": "BANCO BTG PACTUAL"}, {"produto": "LCA BANCO RABOBANK 96 % CDI 11/09/2028 I", "banco": "ITAÚ UNIBANCO"}, {"produto": "LCA BANCO RABOBANK 97 % CDI 09/2029", "banco": "ITAÚ UNIBANCO"}, {"produto": "LCA ITAÚ 92 % CDI 18/11/27 (17/05/2026)", "banco": "ITAÚ UNIBANCO"}, {"produto": "LCA ITAÚ 92,5 % CDI 28/09/2026", "banco": "ITAÚ UNIBANCO"}, {"produto": "LCA ITAÚ 94,5 % CDI 09/08/2027 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "LCA ITAÚ PRÉ 12,29% 06/09/2027", "banco": "ITAÚ UNIBANCO"}, {"produto": "LCA RABOBANKBM DI 97,00 09/2029", "banco": "ITAÚ UNIBANCO"}, {"produto": "LCI CEF 97 % CDI 29/07/2026", "banco": "ITAÚ UNIBANCO"}, {"produto": "LIG ITAÚ IPCA + 4,02 % 15/05/2035 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "LIG ITAÚ IPCA + 4,1 % 15/05/2035 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "LIG ITAÚ IPCA + 5,65 % 15/05/2029 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "NTN-B 08/2030", "banco": "ITAÚ UNIBANCO"}, {"produto": "NTN-B 08/2032", "banco": "ITAÚ UNIBANCO"}, {"produto": "PETR4", "banco": "ITAÚ UNIBANCO"}, {"produto": "PORTFÓLIO BALANCEADO CLASSE DE INVESTIMENTO EM AÇÕES - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "SPX RAPTOR PVT FIC FIM IE", "banco": "ITAÚ UNIBANCO"}, {"produto": "TFO DI DEB CIC DE CLASSE DE INVESTIMENTO RF INCENTIVADO EM INFRA - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO MM CIC DE CLASSES DE INVESTIMENTO MULTI CP - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "ICATU"}, {"produto": "TFO PREV MMI ICATU PREV FIM", "banco": "ICATU"}, {"produto": "TFO SICURO FIF CIC RF - SUBCLASSE SPECIAL SITS FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO SPECIAL SITS FIF - SUBCLASSE TORI FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI BP RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}], "T29 - JKSA": [{"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL TESOURO SELIC REFERENCIADO FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL TESOURO SELIC SIMPLES INSTITUCIONAL FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "ITAÚ UNIBANCO"}, {"produto": "CDB BANCO BMG S.A. PRÉ 12,47% 10/07/2028", "banco": "ITAÚ UNIBANCO"}, {"produto": "CDB BRADESCO PRÉ 11,53% 03/07/2026", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB BTG PACTUAL 100 % CDI 31/05/2027", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB ITAÚ PRÉ 11,83% 05/07/2027", "banco": "ITAÚ UNIBANCO"}, {"produto": "CDB ITAÚ PRÉ 12,09% 03/07/2028", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE LORTA7 IPCA + 5,4702 % 15/03/2031", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE RIS414 IPCA + 7,3591 % 15/09/2034", "banco": "BANCO BTG PACTUAL"}, {"produto": "ITAÚ PRIVATE WEALTH IQ REF DI FIC RF", "banco": "ITAÚ UNIBANCO"}, {"produto": "LF BRADESCO IPCA + 6,29 % 08/07/2026 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF BTG PACTUAL 106,35 % CDI 06/04/2026 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF BTG PACTUAL IPCA + 6,72 % 06/06/2029 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF BTG PACTUAL IPCA + 6,9 % 06/06/2034 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF SAFRA IPCA + 5,87 % 18/05/2026 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF SAFRA IPCA + 6,62 % 14/10/2026 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "LF SAFRA PRÉ 10,6% 15/05/2026 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "NTN-B PRINC IPCA + 5,33% 15/08/2028", "banco": "ITAÚ UNIBANCO"}, {"produto": "NTN-B PRINC IPCA + 6,26 % 15/05/2035", "banco": "ITAÚ UNIBANCO"}, {"produto": "TFO MM CIC DE CLASSES DE INVESTIMENTO MULTI CP - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TNB INSTITUCIONAL INFLAÇÃO CURTA ATIVA CIC DE CLASSES DE INVESTIMENTO RF - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI BP RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}], "T501 - DML": [{"produto": "CAIXA", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 06/09/2027 III", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 23/09/2027 IV", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 26/08/2027 VI", "banco": "SANTANDER"}, {"produto": "CRA RESA IPCA + 5,8 % 17/06/2030 10ª S 2ª E", "banco": "SANTANDER"}, {"produto": "KNUQ11", "banco": "SANTANDER"}, {"produto": "LCA DAYCOVAL 97 % CDI 09/04/2027", "banco": "SANTANDER"}, {"produto": "LCA SANTANDER PRÉ 10,05% 29/05/2026", "banco": "SANTANDER"}, {"produto": "LCI BRB 96 % CDI 17/06/2027", "banco": "SANTANDER"}, {"produto": "TFO DIC FIC FIM CP", "banco": "SANTANDER"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "BRADESCO"}, {"produto": "TFO PREV MMI ICATU PREV FIM", "banco": "BRADESCO"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "SANTANDER"}, {"produto": "TORI BP RESP LIMITADA FIF FIA", "banco": "SANTANDER"}, {"produto": "TORI LD RESP LIMITADA FIF CIC RF FIC RF", "banco": "SANTANDER"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "SANTANDER"}], "T501 - JL": [{"produto": "CAIXA", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 06/09/2027 II", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 23/09/2027 II", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 26/08/2027 VII", "banco": "SANTANDER"}, {"produto": "CRI ALLOS CDI + 0,55 % 16/04/2029 1ª S 262ª E", "banco": "SANTANDER"}, {"produto": "CRI LOCALIZA 99 % CDI 21/11/2032 169ª S 1ª E", "banco": "SANTANDER"}, {"produto": "CRI REDE DOR IPCA + 6,1017 % 15/12/2036 397ª S 1ª E", "banco": "SANTANDER"}, {"produto": "KNUQ11", "banco": "SANTANDER"}, {"produto": "LCA DAYCOVAL 98 % CDI 03/04/2028", "banco": "SANTANDER"}, {"produto": "LCA DAYCOVAL 98 % CDI 29/03/2028", "banco": "SANTANDER"}, {"produto": "LCA SANTANDER PRÉ 10% 29/05/2026", "banco": "SANTANDER"}, {"produto": "LCI SANTANDER 97 % CDI 04/05/2026 I", "banco": "SANTANDER"}, {"produto": "TFO DIC FIC FIM CP", "banco": "SANTANDER"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "BRADESCO"}, {"produto": "TFO PREV MMI ICATU PREV FIM", "banco": "BRADESCO"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "SANTANDER"}, {"produto": "TORI BP RESP LIMITADA FIF FIA", "banco": "SANTANDER"}, {"produto": "TORI LD RESP LIMITADA FIF CIC RF FIC RF", "banco": "SANTANDER"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "SANTANDER"}], "T501 - ML": [{"produto": "BNP PARIBAS MATCH RF REFERENCIADO DI FI RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL CDB PLUS FI RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL YIELD DI FI CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 23/09/2027 III", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 26/08/2027 VIII", "banco": "SANTANDER"}, {"produto": "KNUQ11", "banco": "SANTANDER"}, {"produto": "LCA SANTANDER PRÉ 10,85% 24/06/2026", "banco": "SANTANDER"}, {"produto": "LCI BRB 96 % CDI 17/06/2027 I", "banco": "SANTANDER"}, {"produto": "LCI SANTANDER 97 % CDI 22/04/2026", "banco": "SANTANDER"}, {"produto": "MAPFRE CONFIANZA FIF RF REF DI CRÉD PRIV - RESP LIMITADA", "banco": "BANCO BTG PACTUAL"}, {"produto": "PORTO SEGURO RF REFERENCIADO DI FI RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO DIC FIC FIM CP", "banco": "SANTANDER"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "SANTANDER"}, {"produto": "TORI BP RESP LIMITADA FIF FIA", "banco": "SANTANDER"}, {"produto": "TORI LD RESP LIMITADA FIF CIC RF FIC RF", "banco": "SANTANDER"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "SANTANDER"}], "T5151 - RB": [{"produto": "BTG PACTUAL CRÉDITO CORPORATIVO II PREV FICFIF MM", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB BANCO PINE PRÉ 8,35% 13/10/2026", "banco": "BANCO BTG PACTUAL"}, {"produto": "COE GOLDMAN SACHS (ativo sub: GSISM37E) 04/09/2026 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "DEBÊNTURE PETR27 IPCA + 3,9 % 15/09/2034 I", "banco": "BANCO BTG PACTUAL"}, {"produto": "ITAÚ HIGH YIELD PREV P DISTRIBUIDORES BP PREV FIF EM COTAS DE FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}], "T57 - ACF": [{"produto": "CAIXA", "banco": "SANTANDER"}, {"produto": "CAIXA", "banco": "XP INVESTIMENTOS"}, {"produto": "CDB SANTANDER 100 % CDI 01/11/2027 II", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 03/06/2027 V", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 07/06/2027 IV", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 20/08/2027 VIII", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 21/06/2027", "banco": "SANTANDER"}, {"produto": "COE CS SAÚDE DIGITAL FIA", "banco": "XP INVESTIMENTOS"}, {"produto": "CRA BUNGE ALIMENTOS S/A CDI + 2,5 % 08/09/2026 1ª S 198ª E (S/L)", "banco": "SANTANDER"}, {"produto": "CRI BROOKFIELD (Torre Financial Center) CDI + 1,7 % 19/04/2027 453ª S 1ª E", "banco": "SANTANDER"}, {"produto": "CRI BROOKFIELD CDI + 1,7 % 19/04/2027 400ª S 1ª E", "banco": "SANTANDER"}, {"produto": "GOLD11", "banco": "SANTANDER"}, {"produto": "HEADLINE XP VENTURE CAPITAL 3 MULTI - CLASSE A FIM FIP", "banco": "XP INVESTIMENTOS"}, {"produto": "KNCR11", "banco": "SANTANDER"}, {"produto": "LCI SANTANDER 96 % CDI 26/06/2030 (29/12/2025) XXXII", "banco": "SANTANDER"}, {"produto": "LF DAYCOVAL PRÉ 12,9% 10/11/2026", "banco": "SANTANDER"}, {"produto": "TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI", "banco": "XP INVESTIMENTOS"}, {"produto": "TFO IPCA DEB CIC DE CLASSE DE INVESTIMENTO RF INCENTIVADO EM INFRA - RESP LTDA", "banco": "SANTANDER"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "ICATU"}, {"produto": "TFO PREV MMI ICATU PREV FIM", "banco": "ICATU"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "SANTANDER"}, {"produto": "TORI DI DEB RESP LIMITADA FIF CIC INFRA RF FIC RF CP", "banco": "SANTANDER"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "SANTANDER"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "SANTANDER"}, {"produto": "TREND PE X RESP LIMITADA SIMPLES FIC RF", "banco": "XP INVESTIMENTOS"}], "T712 - RB": [{"produto": "AXIA3", "banco": "ITAÚ UNIBANCO"}, {"produto": "AXIA7", "banco": "ITAÚ UNIBANCO"}, {"produto": "B3SA3", "banco": "ITAÚ UNIBANCO"}, {"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL NTN-B 2035 YIELD PREV FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "ITAÚ UNIBANCO"}, {"produto": "CDB ITAÚ 100 % CDI 24/01/2031", "banco": "ITAÚ UNIBANCO"}, {"produto": "CDB ITAÚ 100 % CDI 31/10/2030 IV", "banco": "ITAÚ UNIBANCO"}, {"produto": "CDB ITAÚ 90 % CDI 14/02/2031 (CDB PLUS)", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRA SLC CDI + 0,5 % 16/07/2029 1ª S 203ª E (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRESCERA GROWTH CAPITAL V PVT FIM", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRESCERA VENTURE CAPITAL III PVT FIM", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRI ACHÉ CDI + 0,55 % 15/12/2030 1ª S 249ª E (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRI BROOKFIELD CDI + 1,5 % 19/07/2027 1ª S 177ª E (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRI SOL FACIL PRÉ 16,48% 15/01/2034 3ª S 1ª E (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRI SOLFACIL PRÉ 15,5% 08/05/2030 3ª S 1ª E (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE TPER11 IPCA + 6,4 % 31/03/2028 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE TPER1B IPCA + 5 % 31/12/2072 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE TPER1C 100 % TR 31/12/2060 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE TPER21 IPCA + 6,4 % 31/12/2027 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE TPER2B IPCA + 5 % 31/12/2072 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE TPER2C 100 % TR 31/12/2060 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE TPER31 IPCA + 6,4 % 31/12/2027 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE TPER3B IPCA + 5 % 31/12/2072 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE TPER3C 100 % TR 31/12/2060 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE TPER41 IPCA + 6,4 % 31/03/2028 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE TPER4B IPCA + 5 % 31/12/2072 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE TPER4C 100 % TR 31/12/2060 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ ALGARVE LEGAL CLAIMS II FEEDER FIM", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ DEBÊNTURES INCENTIVADAS PRÉ TARGET 2029 II FIC RF", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ DEBÊNTURES INCENTIVADAS PRÉ TARGET 2030 RESP LIMITADA FI RF", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ FLEXPREV PRIVATE JURO REAL TARGET 2030 II RESP LIMITADA FIF CIC RF FIC RF", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ PRIVATE FLEXPREV JANEIRO RESP LIMITADA FIC RF", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ PRIVATE PÁTRIA REAL ESTATE III FIC FIM CP", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ PRIVATE WEALTH IQ REF DI FIC RF", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ RISING STARS RESP LIMITADA FIC FIM CP", "banco": "ITAÚ UNIBANCO"}, {"produto": "KFOF11", "banco": "ITAÚ UNIBANCO"}, {"produto": "KINEA DESENVOLVIMENTO LOGÍSTICO RESP LIMITADA - KLOG11 FII", "banco": "ITAÚ UNIBANCO"}, {"produto": "KINEA PRIME RESIDENCIAL I PVT RESP LIMITADA - KPRP11 FII", "banco": "ITAÚ UNIBANCO"}, {"produto": "KINEA PRIVATE EQUITY V FEEDER MULTIESTRATÉGIA FIP - A", "banco": "ITAÚ UNIBANCO"}, {"produto": "LCA BANCO RABOBANK 94,75 % CDI 21/05/2027", "banco": "ITAÚ UNIBANCO"}, {"produto": "LCA ITAÚ 92 % CDI 29/11/2028 (30/05/2026)", "banco": "ITAÚ UNIBANCO"}, {"produto": "LCA ITAÚ PRÉ 11,07% 14/06/2027", "banco": "ITAÚ UNIBANCO"}, {"produto": "LCA ITAÚ PRÉ 12,67% 21/06/2027", "banco": "ITAÚ UNIBANCO"}, {"produto": "LCI ITAÚ 95,5 % CDI 10/12/2026 (12/09/2025)", "banco": "ITAÚ UNIBANCO"}, {"produto": "LIG ITAÚ 101 % CDI 22/02/2027 (S/L) I", "banco": "ITAÚ UNIBANCO"}, {"produto": "LIGT3", "banco": "ITAÚ UNIBANCO"}, {"produto": "PRIO3", "banco": "ITAÚ UNIBANCO"}, {"produto": "REDPOINT EVENTURES 2 FIC FIM", "banco": "ITAÚ UNIBANCO"}, {"produto": "RIAA3", "banco": "ITAÚ UNIBANCO"}, {"produto": "TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO IPCA DEB CIC DE CLASSE DE INVESTIMENTO RF INCENTIVADO EM INFRA - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO PREV EQUITY ICATU QUALI PREV FIM CP", "banco": "ICATU"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "ICATU"}, {"produto": "TFO PREV MMI ICATU PREV FIM", "banco": "ICATU"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI DI DEB RESP LIMITADA FIF CIC INFRA RF FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "VBBR3", "banco": "ITAÚ UNIBANCO"}], "T7677 - CP": [{"produto": "BRASIL CAPITAL 30 ADVISORY FIC FIA", "banco": "XP INVESTIMENTOS"}, {"produto": "CAIXA", "banco": "XP INVESTIMENTOS"}, {"produto": "CONSTELLATION INSTITUCIONAL FUNDO DE INVESTIMENTO EM COTAS DE FUNDOS DE INVESTIMENTO DE AÇÕES", "banco": "XP INVESTIMENTOS"}, {"produto": "CRA SEARA ALIMENTOS LTDA. DOLAR - PTAX + 6,35 % 05/09/2029 1ª S 218ª E (07/03/2025)", "banco": "XP INVESTIMENTOS"}, {"produto": "CRA SEARA ALIMENTOS LTDA. IPCA + 6,793 % 15/09/2034 2ª S 218ª E (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "CRI Somos Desenvolvimento Imobiliário Ltda. IPCA +11% 20/12/2028 1ªS 75ºE", "banco": "XP INVESTIMENTOS"}, {"produto": "CSHG RECEBÍVEIS IMOBILIÁRIOS FII", "banco": "XP INVESTIMENTOS"}, {"produto": "DEBÊNTURE EGIEA2 PRÉ 12,4974% 15/08/2029", "banco": "XP INVESTIMENTOS"}, {"produto": "DEBÊNTURE GASC28 IPCA +7,528% 15/03/2040", "banco": "XP INVESTIMENTOS"}, {"produto": "DEBÊNTURE PETR26 IPCA + 4,2186 % 15/01/2029", "banco": "XP INVESTIMENTOS"}, {"produto": "EB FIBRA CLASSE D FIP", "banco": "XP INVESTIMENTOS"}, {"produto": "GAMA BRIDGEWATER GLOBAL RISK PREMIUM USD FIC FIM IE", "banco": "XP INVESTIMENTOS"}, {"produto": "HGRE11", "banco": "XP INVESTIMENTOS"}, {"produto": "HSI MALLS FII", "banco": "XP INVESTIMENTOS"}, {"produto": "LCI CEF 97 % CDI 19/10/2026", "banco": "XP INVESTIMENTOS"}, {"produto": "LF XP PRÉ 15,9% 18/12/2026 (S/L)", "banco": "XP INVESTIMENTOS"}, {"produto": "MXRF11", "banco": "XP INVESTIMENTOS"}, {"produto": "NTN-B 05/2035", "banco": "XP INVESTIMENTOS"}, {"produto": "NTN-B 08/2050", "banco": "XP INVESTIMENTOS"}, {"produto": "TREND PE II FIC RF SIMPLES", "banco": "XP INVESTIMENTOS"}, {"produto": "TREND PÓS-FIXADO FIC RF", "banco": "XP INVESTIMENTOS"}, {"produto": "VERDE AM AÇÕES FICFIFA - RESP LIMITADA", "banco": "XP INVESTIMENTOS"}, {"produto": "VGHF11", "banco": "XP INVESTIMENTOS"}, {"produto": "VINCI SHOPPING CENTERS FII", "banco": "XP INVESTIMENTOS"}, {"produto": "XP MALLS FII", "banco": "XP INVESTIMENTOS"}, {"produto": "XP REFERENCIADO RF DI FI RF CP", "banco": "XP INVESTIMENTOS"}, {"produto": "XPLG11", "banco": "XP INVESTIMENTOS"}, {"produto": "XPLG12", "banco": "XP INVESTIMENTOS"}, {"produto": "XPML12", "banco": "XP INVESTIMENTOS"}], "T7677 - SSM": [{"produto": "AQUA CAPITAL PRIVATE EQUITY AGRO  FIP 8", "banco": "UBS"}, {"produto": "BRCR11 FII", "banco": "BANCO BTG PACTUAL"}, {"produto": "BRIO REAL ESTATE III FII CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "SANTANDER"}, {"produto": "CDB DAYCOVAL 99,39 % CDI 14/05/2026", "banco": "BANCO BTG PACTUAL"}, {"produto": "CENESP FII", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA JSL S.A IPCA + 6,4527 % 17/02/2031 2ª S 309ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA RESA IPCA + 6,043 % 16/03/2059 2ª S 2ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA SLC IPCA + 6,75 % 15/07/2031 1ª S 1ª E", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRESCERA GROWTH CAPITAL V FEEDER I MULTIESTRATEGIA FIP", "banco": "BRL TRUST"}, {"produto": "CRI ALLOS CDI + 0,55 % 16/04/2029 1ª S 262ª E", "banco": "BANCO BTG PACTUAL"}, {"produto": "DEBÊNTURE ENERGISA IPCA + 4,6249 % 15/04/2026 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "DEBÊNTURE LTCM12 IPCA + 8,75 % 15/04/2029 (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "EB BIP  FIP MULTIESTRATÉGIA RESP LIMITADA", "banco": "BRL TRUST"}, {"produto": "HGBS11", "banco": "BANCO BTG PACTUAL"}, {"produto": "HGLG11", "banco": "BANCO BTG PACTUAL"}, {"produto": "HGRE11", "banco": "BANCO BTG PACTUAL"}, {"produto": "KNHY11", "banco": "BANCO BTG PACTUAL"}, {"produto": "KNRI11 FII", "banco": "BANCO BTG PACTUAL"}, {"produto": "LCA BANCO RABOBANK 99 % CDI 26/07/2027", "banco": "BANCO BTG PACTUAL"}, {"produto": "LCA BB 97 % CDI 23/04/2029", "banco": "BANCO DO BRASIL"}, {"produto": "LCI BB 92,5 % CDI 06/08/2027", "banco": "BANCO DO BRASIL"}, {"produto": "LCI CEF 96,5 % CDI 03/12/2026", "banco": "BANCO BTG PACTUAL"}, {"produto": "LCI CEF 96,5 % CDI 17/02/2027", "banco": "BANCO BTG PACTUAL"}, {"produto": "NTN-B 05/2035", "banco": "BANCO BTG PACTUAL"}, {"produto": "NTN-B 05/2045", "banco": "BANCO BTG PACTUAL"}, {"produto": "PFIN11 FIP", "banco": "BANCO BTG PACTUAL"}, {"produto": "RECR11 FII", "banco": "BANCO BTG PACTUAL"}, {"produto": "SPECTRA V LATAM FIM", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO DIC FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI BP RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "UBS CONSENSO ACCESS MONASHEES X FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "XP MALLS FII", "banco": "BANCO BTG PACTUAL"}, {"produto": "XPLG11", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI LD RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}], "T771 - ABO": [{"produto": "BOCOM BBM RESP LIMITADA FIAGRO FIDC 1", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL DIGITAL TESOURO SELIC FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL TESOURO SELIC REFERENCIADO FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CDB SANTANDER 100 % CDI 13/10/2027 IV", "banco": "SANTANDER"}, {"produto": "CRA AGROPASTORIL JOTABASSO LTDA. CDI + 2,3 % 21/11/2029 1ª S 211ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA EUCATEX S/A 105,15 % CDI 15/01/2030 2ª S 100ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA SLC IPCA + 7,31 % 15/08/2031 3ª S 90ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA SOROCABA REFRESCOS PRÉ 12,45% 15/08/2031 1ª S 342ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRI CLI SUL S/A IPCA + 6,6079 % 16/11/2033 1ª S 211ª E", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRI VOTORANTIM CIMENTOS S.A. IPCA + 6,33 % 17/12/2035 2ª S 190ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "LCI ITAÚ 94,5 % CDI 05/07/2027", "banco": "BANCO BTG PACTUAL"}, {"produto": "MILAS II RESP LIMITADA FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "NTN-B IPCA + 6,63 % 15/08/2028", "banco": "BANCO BTG PACTUAL"}, {"produto": "PORTFÓLIO BALANCEADO CLASSE DE INVESTIMENTO EM AÇÕES - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "PORTFOLIO SPECIAL OPPORT RESP LIMITADA FIC FIM", "banco": "BANCO BTG PACTUAL"}, {"produto": "SPECTRA V LATAM FIM", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO PREV EQUITY ICATU QUALI PREV FIM CP", "banco": "BRADESCO"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "BRADESCO"}, {"produto": "TFO PREV MMI ICATU PREV FIM", "banco": "BRADESCO"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}], "T8484 - RDC": [{"produto": "BRADESCO EXPLORER PRIVATE EQUITY MULTIESTRATÉGIA FIP", "banco": "BRADESCO"}, {"produto": "CAIXA", "banco": "BRADESCO"}], "T858 - FC": [{"produto": "BRADESCO GENOA CAPITAL CRUISE PGBL/VGBL FIC FIM", "banco": "BRADESCO"}, {"produto": "BRADESCO MAX FIC RENDA FIXA REFERENCIADO DI FIC RF", "banco": "BRADESCO"}, {"produto": "BRADESCO ULTRA PGBL/VGBL FIC RF CP", "banco": "BRADESCO"}, {"produto": "BTG PACTUAL CDB I FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "BTG PACTUAL ENERGY DEBT RESP LIMITADA FIP INFRA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "CAIXA", "banco": "BRADESCO"}, {"produto": "CAIXA", "banco": "ITAÚ UNIBANCO"}, {"produto": "CDB BRADESCO 100,5 % CDI 07/03/2029", "banco": "BRADESCO"}, {"produto": "CDB BRADESCO 100,5 % CDI 21/02/2029", "banco": "BRADESCO"}, {"produto": "COE BRADESCO CITIGRND 01/10/2029 (S/L)", "banco": "BRADESCO"}, {"produto": "COE BRADESCO S&P500 18/11/2027 (S/L)", "banco": "BRADESCO"}, {"produto": "CRA BTG 102 % CDI 15/09/2033 1ª S 106ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA BTG PACTUAL IPCA + 6,01 % 15/12/2033 3ª S 124ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA BTG PACTUAL IPCA + 6,28 % 15/07/2033 3ª S 92ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRA DEXCO S.A. CDI + 0,45 % 16/06/2028 1ª S 187ª E (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRA ENGELHART PRÉ 11,79% 15/07/2033 4ª S 92ª E (S/L)", "banco": "BANCO BTG PACTUAL"}, {"produto": "CRI BARZEL IPCA + 6,22 % 14/08/2028 1ª S 186ª E (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "CRI BROOKFIELD CDI + 1,5 % 19/07/2027 1ª S 177ª E (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "DEBÊNTURE ASCP13 IPCA + 7,55 % 15/03/2030", "banco": "BANCO BTG PACTUAL"}, {"produto": "DEBÊNTURE TRCC11 IPCA + 5,42 % 15/09/2028 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ AMG CREDIT OPPORTUNITIES I FEEDER RESP LIMITADA FIM CP", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ FUND OF FUNDS ORION FIC FIM CP IE", "banco": "ITAÚ UNIBANCO"}, {"produto": "ITAÚ PRIVATE WEALTH IQ REF DI FIC RF", "banco": "ITAÚ UNIBANCO"}, {"produto": "KNCR11", "banco": "ITAÚ UNIBANCO"}, {"produto": "KNIP11", "banco": "ITAÚ UNIBANCO"}, {"produto": "LIG BANCO ITAU S.A IPCA + 5,26 % 17/08/2026 (S/L)", "banco": "ITAÚ UNIBANCO"}, {"produto": "LIG BRADESCO IPCA + 5,72 % 15/09/2029 (S/L)", "banco": "BRADESCO"}, {"produto": "RDLI11", "banco": "ITAÚ UNIBANCO"}, {"produto": "TFO PREV EQUITY ICATU QUALI PREV FIM CP", "banco": "BRADESCO"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "BRADESCO"}, {"produto": "TFO PREV MMI ICATU PREV FIM", "banco": "BRADESCO"}], "T858 - VC": [{"produto": "CDB SANTANDER 100 % CDI 08/12/2027 III", "banco": "SANTANDER"}, {"produto": "LCA SANTANDER 94 % CDI 22/06/2026", "banco": "SANTANDER"}, {"produto": "TORI BP RESP LIMITADA FIF FIA", "banco": "SANTANDER"}, {"produto": "TORI DI DEB RESP LIMITADA FIF CIC INFRA RF FIC RF CP", "banco": "SANTANDER"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "SANTANDER"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "SANTANDER"}], "T8816 - LG": [{"produto": "CAIXA", "banco": "SANTANDER"}, {"produto": "CDB SANTANDER 100 % CDI 05/11/2029", "banco": "SANTANDER"}], "T8846 - AR": [{"produto": "B3SA3", "banco": "BRADESCO"}, {"produto": "BRADESCO DEBÊNTURES INC CDI II RESP LIMITADA FIC RF", "banco": "BRADESCO"}, {"produto": "BRADESCO PREMIUM PGBL/VGBL RESP LIMITADA FIC RF CP", "banco": "BRADESCO"}, {"produto": "BRADESCO PRIVATE PERFORMANCE PGBL/VGBL FIC RF CP", "banco": "BRADESCO"}, {"produto": "BRADESCO ULTRA PGBL/VGBL FIC RF CP", "banco": "BRADESCO"}, {"produto": "BRASIL NORDESTE DESENVOLVIMENTO IMOBILIÁRIO FIC FIM", "banco": "BRADESCO"}, {"produto": "CAIXA", "banco": "BRADESCO"}, {"produto": "CDB BANCO BMG S.A. PRÉ 14,04% 31/03/2027", "banco": "BRADESCO"}, {"produto": "CDB BANCO VOITER S.A PRÉ 14,24% 30/03/2026", "banco": "BRADESCO"}, {"produto": "CDB BRADESCO 100,5 % CDI 13/02/2029", "banco": "BRADESCO"}, {"produto": "CRI PETROBRAS IPCA + 4 % 19/12/2028 87ª S 1ª E (S/L)", "banco": "BRADESCO"}, {"produto": "NTN-B 08/2032", "banco": "BRADESCO"}, {"produto": "TFO PREV EQUITY ICATU QUALI PREV FIM CP", "banco": "BRADESCO"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "BRADESCO"}, {"produto": "TFO PREV MMI ICATU PREV FIM", "banco": "BRADESCO"}], "T8846 - ER": [{"produto": "BRADESCO H PGBL/VGBL ATIVO RESP LIMITADA FIC RF", "banco": "BRADESCO"}, {"produto": "BRADESCO PREV FÁCIL PGBL X RESP LIMITADA FIC RF", "banco": "BRADESCO"}, {"produto": "BRADESCO PRIME H PLUS RESP LIMITADA FIC RF", "banco": "BRADESCO"}, {"produto": "BRADESCO PRIVATE PERFORMANCE PGBL/VGBL FIC RF CP", "banco": "BRADESCO"}, {"produto": "CAIXA", "banco": "BRADESCO"}, {"produto": "CDB BRADESCO 100,5 % CDI 10/12/2028 II", "banco": "BRADESCO"}, {"produto": "CDB BRADESCO 100,5 % CDI 15/02/2029 I", "banco": "BRADESCO"}, {"produto": "CDB BRADESCO 100,5 % CDI 16/11/2028", "banco": "BRADESCO"}, {"produto": "CDB BRADESCO 100,5 % CDI 24/01/2029", "banco": "BRADESCO"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "ICATU"}, {"produto": "TFO PREV MMI ICATU PREV FIM", "banco": "ICATU"}], "T98 - FITA AZUL": [{"produto": "FITA AZUL FIC FIM FIC FIM CP", "banco": "XP INVESTIMENTOS"}], "T98 - MABB": [{"produto": "MILAS PREV FIM FIM CP", "banco": "BANCO BTG PACTUAL"}], "T98 - TORI CONSULTORIA": [{"produto": "CAIXA", "banco": "BANCO BTG PACTUAL"}, {"produto": "PORTFÓLIO BALANCEADO CLASSE DE INVESTIMENTO EM AÇÕES - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TAC FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TDC CLASSE DE INVESTIMENTO MULTI - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO CRÉDITO ESTRUTURADO FIF FIM SUBCLASSE TORI", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO DI DEB CIC DE CLASSE DE INVESTIMENTO RF INCENTIVADO EM INFRA - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO MM CIC DE CLASSES DE INVESTIMENTO MULTI CP - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TFO PREV EQUITY ICATU QUALI PREV FIM CP", "banco": "BRADESCO"}, {"produto": "TFO PREV JUROS REAIS ICATU PREV QUALIF FIM CP", "banco": "BRADESCO"}, {"produto": "TFO PREV MMI ICATU PREV FIM", "banco": "BRADESCO"}, {"produto": "TFO SICURO FIF RF - SUBCLASSE TORI PRISMA FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TLD CLASSE DE INVESTIMENTO RENDA FIXA - RESP LTDA FI RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "TLD INSTITUCIONAL INFLAÇÃO LONGA ATIVA CIC DE CLASSES DE INVESTIMENTO RF - RESP LIMITADA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TMM FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TNB CLASSE DE INVESTIMENTO RENDA FIXA - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TNB INSTITUCIONAL INFLAÇÃO CURTA ATIVA CIC DE CLASSES DE INVESTIMENTO RF - RESP LTDA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI AÇÕES RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI BP RESP LIMITADA FIF FIA", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI DI DEB RESP LIMITADA FIF CIC INFRA RF FIC RF CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI LD RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI MM RESP LIMITADA FIC FIM CP", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI NB RESP LIMITADA FIF CIC RF FIC RF", "banco": "BANCO BTG PACTUAL"}, {"produto": "TORI PRISMA FIF FIM CP", "banco": "BANCO BTG PACTUAL"}], "T98 - VCLR": [{"produto": "PB INCASE RESP LIMITADA FIF CIC FIM FIC FIM CP", "banco": "SANTANDER"}]};
+let posicoes = JSON.parse(JSON.stringify(POSICOES_BASE));
+
+const INITIAL_DATA = {
+  boards: [
+    { id: 'b1', name: 'Kanban' }
+  ],
+  activeBoard: 'b1',
+  cols: {
+    b1: [
+      { id: 'c1', name: 'Solicitado', cards: [] },
+      { id: 'c2', name: 'Enviado', cards: [] },
+      { id: 'c3', name: 'Concluído', cards: [] },
+      { id: 'c4', name: 'Resgatado', cards: [], _resgatado: true }
+    ]
+  }
+};
+
+let data = null;
+let dragCardId, dragColId, editTarget;
+const uid = () => 'id' + Math.random().toString(36).slice(2, 9);
+
+function save() {
+  if (window._firebaseSave) window._firebaseSave();
+}
+
+function getCols() { return data.cols[data.activeBoard] || []; }
+
+function ensureResgatadoCol(boardId) {
+  const cols = data.cols[boardId];
+  if (!cols) return;
+  if (!cols.find(c => c._resgatado)) {
+    cols.push({ id: uid(), name: 'Resgatado', cards: [], _resgatado: true });
+  }
+}
+
+function parseDateBR(str) {
+  if (!str) return null;
+  const [d, m, y] = str.split('/');
+  return new Date(parseInt(y), parseInt(m) - 1, parseInt(d));
+}
+
+function checkLiquidacoes() {
+  // desativado — nenhuma movimentação automática
+}
+
+function render() {
+  if (!data) return;
+  renderTabs();
+  renderBoard();
+}
+
+/* TABS */
+function renderTabs() {
+  const wrap = document.getElementById('boardTabs');
+  wrap.innerHTML = '';
+
+  data.boards.forEach(b => {
+    const btn = document.createElement('button');
+    btn.className = 'board-tab' + (b.id === data.activeBoard ? ' active' : '');
+    btn.textContent = b.name;
+    btn.onclick = () => { data.activeBoard = b.id; render(); };
+    wrap.appendChild(btn);
+  });
+
+  if (data.showNewBoard) {
+    const inp = document.createElement('input');
+    inp.className = 'new-board-input';
+    inp.placeholder = 'Nome do board';
+    inp.value = data.newBoardName;
+    inp.oninput = e => data.newBoardName = e.target.value;
+    inp.onkeydown = e => {
+      if (e.key === 'Enter') addBoard();
+      if (e.key === 'Escape') { data.showNewBoard = false; render(); }
+    };
+    wrap.appendChild(inp);
+    const ok = document.createElement('button');
+    ok.className = 'btn-sm';
+    ok.style.marginLeft = '4px';
+    ok.textContent = 'Criar';
+    ok.onclick = addBoard;
+    wrap.appendChild(ok);
+    setTimeout(() => inp.focus(), 30);
+  } else {
+    const add = document.createElement('button');
+    add.className = 'board-tab-add';
+    add.title = 'Novo board';
+    add.textContent = '+';
+    add.onclick = () => { data.showNewBoard = true; data.newBoardName = ''; render(); };
+    wrap.appendChild(add);
+  }
+}
+
+function addBoard() {
+  const n = (data.newBoardName || '').trim();
+  if (!n) return;
+  const id = uid();
+  data.boards.push({ id, name: n });
+  data.cols[id] = [];
+  ensureResgatadoCol(id);
+  data.activeBoard = id;
+  data.showNewBoard = false;
+  data.newBoardName = '';
+  render();
+}
+
+/* BOARD */
+function renderBoard() {
+  const wrap = document.getElementById('boardWrap');
+  wrap.innerHTML = '';
+  const cols = getCols();
+
+  if (cols.length === 0 && !data.addColForm) {
+    const em = document.createElement('div');
+    em.className = 'empty-state';
+    em.innerHTML = '<div style="font-size:28px;margin-bottom:8px">📋</div>Board vazio.<br>Adicione uma coluna para começar.';
+    wrap.appendChild(em);
+  }
+
+  cols.forEach(col => {
+    wrap.appendChild(buildCol(col));
+  });
+
+  const addWrap = document.createElement('div');
+  addWrap.className = 'add-col-wrap';
+
+  if (data.addColForm) {
+    const form = document.createElement('div');
+    form.className = 'add-col-form';
+    const inp = document.createElement('input');
+    inp.placeholder = 'Nome da coluna';
+    inp.value = data.newColName || '';
+    inp.oninput = e => data.newColName = e.target.value;
+    inp.onkeydown = e => {
+      if (e.key === 'Enter') addCol();
+      if (e.key === 'Escape') { data.addColForm = false; render(); }
+    };
+    const row = document.createElement('div');
+    row.className = 'form-row';
+    const ok = document.createElement('button');
+    ok.className = 'btn-primary'; ok.textContent = 'Criar coluna'; ok.onclick = addCol;
+    const ca = document.createElement('button');
+    ca.className = 'btn-ghost'; ca.textContent = 'Cancelar';
+    ca.onclick = () => { data.addColForm = false; render(); };
+    row.appendChild(ok); row.appendChild(ca);
+    form.appendChild(inp); form.appendChild(row);
+    addWrap.appendChild(form);
+    setTimeout(() => inp.focus(), 30);
+  } else {
+    const btn = document.createElement('button');
+    btn.className = 'add-col-btn';
+    btn.innerHTML = '<span style="font-size:16px;line-height:1">+</span> Nova coluna';
+    btn.onclick = () => { data.addColForm = true; data.newColName = ''; render(); };
+    addWrap.appendChild(btn);
+  }
+  wrap.appendChild(addWrap);
+}
+
+function buildCol(col) {
+  const div = document.createElement('div');
+  div.className = 'col' + (col._resgatado ? ' _resgatado-col' : '');
+  div.dataset.colId = col.id;
+
+  div.ondragover = e => { e.preventDefault(); div.classList.add('drag-over-col'); };
+  div.ondragleave = e => { if (!div.contains(e.relatedTarget)) div.classList.remove('drag-over-col'); };
+  div.ondrop = e => { e.preventDefault(); div.classList.remove('drag-over-col'); dropCard(col.id, null); };
+
+  const hdr = document.createElement('div');
+  hdr.className = 'col-header';
+
+  const nameEl = document.createElement('input');
+  nameEl.className = 'col-name';
+  nameEl.value = col.name;
+  nameEl.onblur = e => { col.name = e.target.value.trim() || col.name; save(); };
+  nameEl.onkeydown = e => { if (e.key === 'Enter') e.target.blur(); };
+
+  const cnt = document.createElement('span');
+  cnt.className = 'col-count';
+  cnt.textContent = col.cards.length;
+
+  const menuBtn = document.createElement('button');
+  menuBtn.className = 'col-menu-btn';
+  menuBtn.textContent = '×';
+  menuBtn.title = 'Excluir coluna';
+  menuBtn.onclick = () => {
+    if (col.cards.length > 0 && !confirm(`Excluir "${col.name}" com ${col.cards.length} card(s)?`)) return;
+    const cols = getCols();
+    cols.splice(cols.findIndex(c => c.id === col.id), 1);
+    render();
+  };
+
+  hdr.appendChild(nameEl);
+  hdr.appendChild(cnt);
+
+  const cols = getCols();
+  const colIdx = cols.findIndex(c => c.id === col.id);
+  if (colIdx === 1) {
+    const exportBtn = document.createElement('button');
+    exportBtn.className = 'col-export-btn';
+    exportBtn.textContent = '↓ Exportar';
+    exportBtn.title = 'Exportar cards e avançar para próxima etapa';
+    exportBtn.onclick = () => exportCol(col);
+    hdr.appendChild(exportBtn);
+  }
+
+  const isConcluido = col.name.trim().toLowerCase() === 'concluído' || col.name.trim().toLowerCase() === 'concluido';
+  if (isConcluido) {
+    const uploadInput = document.createElement('input');
+    uploadInput.type = 'file';
+    uploadInput.accept = '.xlsx';
+    uploadInput.style.display = 'none';
+    uploadInput.onchange = () => processarLiquidacoes(uploadInput);
+    div.appendChild(uploadInput);
+
+    const liqBtn = document.createElement('button');
+    liqBtn.className = 'col-export-btn';
+    liqBtn.textContent = '⬆ Liquidações';
+    liqBtn.title = 'Upload de liquidações';
+    liqBtn.style.marginLeft = '4px';
+    liqBtn.style.padding = '2px 6px';
+    liqBtn.style.fontSize = '10px';
+    liqBtn.onclick = () => uploadInput.click();
+    hdr.appendChild(liqBtn);
+  }
+
+  hdr.appendChild(menuBtn);
+  div.appendChild(hdr);
+
+  const area = document.createElement('div');
+  area.className = 'cards-area';
+  area.ondragover = e => e.preventDefault();
+  area.ondrop = e => { e.preventDefault(); dropCard(col.id, null); };
+
+  col.cards.forEach(card => area.appendChild(buildCard(card, col.id)));
+  div.appendChild(area);
+
+  // Só permite adicionar card na primeira coluna (índice 0), ignorando a coluna Resgatado
+  const allCols = getCols();
+  const nonResgatado = allCols.filter(c => !c._resgatado);
+  const isFirstCol = nonResgatado.length > 0 && nonResgatado[0].id === col.id;
+
+  if (data.cardForms && data.cardForms[col.id]) {
+    div.appendChild(buildCardForm(col.id));
+  } else if (isFirstCol) {
+    const addBtn = document.createElement('button');
+    addBtn.className = 'add-card-btn';
+    addBtn.textContent = '+ Adicionar card';
+    addBtn.onclick = () => {
+      if (!data.cardForms) data.cardForms = {};
+      data.cardForms[col.id] = { title: '', desc: '', tag: 'slate', author: '', cliente: '', fundo: '', cnpj: '', operation: '', value: '', banco: '' };
+      render();
+    };
+    div.appendChild(addBtn);
+  }
+
+  return div;
+}
+
+function buildCard(card, colId) {
+  const div = document.createElement('div');
+  div.className = 'card' + (card.operation ? ` op-${card.operation}` : '');
+  div.draggable = true;
+  div.dataset.cardId = card.id;
+
+  div.ondragstart = e => {
+    dragCardId = card.id; dragColId = colId;
+    div.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+  };
+  div.ondragend = () => { div.classList.remove('dragging'); dragCardId = null; };
+  div.ondragover = e => { e.preventDefault(); e.stopPropagation(); div.classList.add('drag-over'); };
+  div.ondragleave = () => div.classList.remove('drag-over');
+  div.ondrop = e => { e.preventDefault(); e.stopPropagation(); div.classList.remove('drag-over'); dropCard(colId, card.id); };
+
+  if (card.shore === 'offshore') {
+    const badge = document.createElement('span');
+    badge.className = 'shore-badge offshore';
+    badge.textContent = 'Offshore';
+    div.appendChild(badge);
+  }
+
+  // título removido da visualização do card
+
+
+
+  if (card.createdAt || card.author || card.cliente) {
+    const metaWrap = document.createElement('div');
+    metaWrap.style.cssText = 'display:flex;flex-direction:column;gap:4px;margin-top:7px;';
+
+    if (card.createdAt || card.author) {
+      const row1 = document.createElement('div');
+      row1.className = 'card-meta';
+      row1.style.marginTop = '0';
+      if (card.createdAt) {
+        const dateEl = document.createElement('div');
+        dateEl.className = 'card-meta-item';
+        dateEl.innerHTML = `<svg width="11" height="11" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="1" y="2.5" width="12" height="10.5" rx="2" stroke="currentColor" stroke-width="1.2"/><path d="M1 5.5h12" stroke="currentColor" stroke-width="1.2"/><path d="M4.5 1v3M9.5 1v3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>${card.createdAt}`;
+        row1.appendChild(dateEl);
+      }
+      if (card.author) {
+        const authorEl = document.createElement('div');
+        authorEl.className = 'card-meta-item';
+        authorEl.innerHTML = `<svg width="11" height="11" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="7" cy="4.5" r="2.8" stroke="currentColor" stroke-width="1.2"/><path d="M1.5 12.5c0-2.485 2.462-4.5 5.5-4.5s5.5 2.015 5.5 4.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>${card.author}`;
+        row1.appendChild(authorEl);
+      }
+      metaWrap.appendChild(row1);
+    }
+
+    if (card.cliente) {
+      const row2 = document.createElement('div');
+      row2.className = 'card-meta';
+      row2.style.marginTop = '0';
+      const clienteEl = document.createElement('div');
+      clienteEl.className = 'card-meta-item';
+      clienteEl.innerHTML = `<svg width="11" height="11" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="1.5" y="1.5" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.2"/><path d="M4.5 5h5M4.5 7.5h3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>${card.cliente}`;
+      row2.appendChild(clienteEl);
+      metaWrap.appendChild(row2);
+    }
+
+    div.appendChild(metaWrap);
+  }
+
+  if (card.operation) {
+    const OP_LABELS = { resgate_total: 'Resgate Total', resgate_parcial: 'Resgate Parcial', aplicacao: "Aporte" };
+    const opMeta = document.createElement('div');
+    opMeta.className = 'card-meta';
+    const opEl = document.createElement('div');
+    opEl.className = 'card-meta-item';
+    opEl.innerHTML = `<svg width="11" height="11" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="1.5" y="2" width="11" height="10" rx="1.5" stroke="currentColor" stroke-width="1.2"/><path d="M4 5.5h6M4 8h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>${OP_LABELS[card.operation] || card.operation}${card.value ? ' · R$ ' + card.value : ''}`;
+    opMeta.appendChild(opEl);
+    if (card.banco) {
+      const bancoEl = document.createElement('div');
+      bancoEl.className = 'card-meta-item';
+      bancoEl.innerHTML = `<svg width="11" height="11" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M1 5.5L7 2l6 3.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><rect x="2.5" y="5.5" width="2" height="5" stroke="currentColor" stroke-width="1.2"/><rect x="6" y="5.5" width="2" height="5" stroke="currentColor" stroke-width="1.2"/><rect x="9.5" y="5.5" width="2" height="5" stroke="currentColor" stroke-width="1.2"/><path d="M1 10.5h12" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>${card.banco}`;
+      opMeta.appendChild(bancoEl);
+    }
+    div.appendChild(opMeta);
+  }
+
+  if (card.fundo) {
+    const fundoMeta = document.createElement('div');
+    fundoMeta.className = 'card-meta';
+    fundoMeta.style.flexDirection = 'column';
+    fundoMeta.style.alignItems = 'flex-start';
+    fundoMeta.style.gap = '3px';
+    const fundoEl = document.createElement('div');
+    fundoEl.className = 'card-meta-item';
+    fundoEl.innerHTML = `<svg width="11" height="11" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M2 11V6l5-4 5 4v5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z" stroke="currentColor" stroke-width="1.2"/><path d="M5 12V9h4v3" stroke="currentColor" stroke-width="1.2"/></svg>${card.fundo}`;
+    fundoMeta.appendChild(fundoEl);
+    if (card.cnpj) {
+      const cnpjEl = document.createElement('div');
+      cnpjEl.className = 'card-meta-item';
+      cnpjEl.style.cssText = 'padding-left:16px;font-family:DM Mono,monospace;color:var(--text3);font-size:10px;';
+      cnpjEl.textContent = card.cnpj;
+      fundoMeta.appendChild(cnpjEl);
+    }
+    div.appendChild(fundoMeta);
+  }
+
+  if (card.fundo && card.createdAt && (card.operation === 'resgate_total' || card.operation === 'resgate_parcial')) {
+    const cotDate = card.cotDate || (calcDates(card.createdAt, card.fundo) || {}).cotDate;
+    const liqDate = card.liqDate || (calcDates(card.createdAt, card.fundo) || {}).liqDate;
+    if (cotDate && liqDate) {
+      const block = document.createElement('div');
+      block.className = 'card-dates-block';
+      const calIcon = `<svg width="10" height="10" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="1" y="2.5" width="12" height="10.5" rx="2" stroke="currentColor" stroke-width="1.2"/><path d="M1 5.5h12" stroke="currentColor" stroke-width="1.2"/><path d="M4.5 1v3M9.5 1v3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>`;
+      const row1 = document.createElement('div'); row1.className = 'card-dates-row';
+      row1.innerHTML = `${calIcon}<span class="card-dates-label">Cotização</span>${cotDate}`;
+      const row2 = document.createElement('div'); row2.className = 'card-dates-row';
+      row2.innerHTML = `${calIcon}<span class="card-dates-label">Liquidação</span>${liqDate}`;
+      block.appendChild(row1);
+      block.appendChild(row2);
+      div.appendChild(block);
+    }
+  }
+
+  const acts = document.createElement('div');
+  acts.className = 'card-actions';
+
+  const editBtn = document.createElement('button');
+  editBtn.className = 'card-action-btn';
+  editBtn.textContent = 'Editar';
+  editBtn.onclick = e => { e.stopPropagation(); openEdit(card, colId); };
+
+  acts.appendChild(editBtn);
+  div.appendChild(acts);
+
+  // Descrição no rodapé do card
+  if (card.desc) {
+    const descBottom = document.createElement('div');
+    descBottom.className = 'card-desc';
+    descBottom.style.cssText = 'margin-top:8px;border-top:1px solid var(--border);padding-top:6px;font-style:italic;';
+    descBottom.textContent = card.desc;
+    div.appendChild(descBottom);
+  }
+
+  // Histórico
+  if (card.history && card.history.length > 0) {
+    const hist = document.createElement('div');
+    hist.className = 'card-history';
+    card.history.forEach((h, i) => {
+      const item = document.createElement('div');
+      item.className = 'card-history-item';
+      const dot = document.createElement('div');
+      dot.className = 'card-history-dot' + (i === 0 ? ' first' : '');
+      const txt = document.createElement('div');
+      const initials = h.user ? h.user.substring(0, 2).toUpperCase() : "";
+      const userBadge = initials ? ` <span title="${h.user}" style="display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;border-radius:50%;background:var(--border2);color:var(--text);font-size:8px;font-weight:700;font-family:DM Sans,sans-serif;vertical-align:middle;cursor:default">${initials}</span>` : "";
+      txt.innerHTML = `<span class="card-history-label">${h.ts}</span>${userBadge} ${h.from ? `<span style="color:var(--text3)">de <em>${h.from}</em> → <em>${h.to}</em></span>` : `<span style="color:var(--text3)">Criado em <em>${h.to}</em></span>`}`;
+      item.appendChild(dot);
+      item.appendChild(txt);
+      hist.appendChild(item);
+    });
+    div.appendChild(hist);
+  }
+
+  // Botão voltar etapa
+  const cols = getCols();
+  const colIdx = cols.findIndex(c => c.id === colId);
+  if (colIdx > 0) {
+    const backBtn = document.createElement('button');
+    backBtn.className = 'card-back-btn';
+    backBtn.innerHTML = `<svg width="10" height="10" viewBox="0 0 14 14" fill="none"><path d="M9 2L4 7l5 5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg> Voltar`;
+    backBtn.title = `Voltar para "${cols[colIdx - 1].name}"`;
+    backBtn.onclick = e => {
+      e.stopPropagation();
+      moveCardToCol(card.id, colId, cols[colIdx - 1].id);
+    };
+    div.appendChild(backBtn);
+  }
+
+  return div;
+}
+
+function buildCardForm(colId) {
+  if (!data.cardForms) data.cardForms = {};
+  const f = data.cardForms[colId];
+  if (!f.shore) f.shore = 'onshore';
+  const wrap = document.createElement('div');
+  wrap.className = 'card-form';
+
+  // Toggle Onshore/Offshore no formulário
+  if (!f.shore) f.shore = 'onshore';
+  const isOffshore = f.shore === 'offshore';
+
+  const shoreToggle = document.createElement('div');
+  shoreToggle.className = 'shore-toggle';
+  const btnOn = document.createElement('button');
+  btnOn.textContent = 'Onshore';
+  btnOn.className = 'shore-btn' + (f.shore === 'onshore' ? ' active' : '');
+  const btnOff = document.createElement('button');
+  btnOff.textContent = 'Offshore';
+  btnOff.className = 'shore-btn' + (f.shore === 'offshore' ? ' active' : '');
+  btnOn.onclick = () => {
+    f.shore = 'onshore';
+    btnOn.classList.add('active'); btnOff.classList.remove('active');
+    onshoreWrap.style.display = 'flex';
+    offshoreWrap.style.display = 'none';
+  };
+  btnOff.onclick = () => {
+    f.shore = 'offshore';
+    btnOff.classList.add('active'); btnOn.classList.remove('active');
+    onshoreWrap.style.display = 'none';
+    offshoreWrap.style.display = 'flex';
+  };
+  shoreToggle.appendChild(btnOn);
+  shoreToggle.appendChild(btnOff);
+
+  // título removido do formulário
+  const title = { value: f.title || 'card' }; // mantém valor interno
+
+  const desc = document.createElement('textarea');
+  desc.placeholder = 'Descrição (opcional)';
+  desc.rows = 2;
+  desc.value = f.desc;
+  desc.oninput = e => f.desc = e.target.value;
+
+
+
+  const authorSel = document.createElement('select');
+  ['— sem responsável','Juliana Paiva','Thiago Campos','Julia Setton','Leticia Costa','Alexandre Luz','Fernanda Valle','Arthur Mello','Claudia Salles','Tharcisio Santos','Ricardo Guimarães'].forEach(name => {
+    const o = document.createElement('option');
+    o.value = name === '— sem responsável' ? '' : name;
+    o.textContent = name;
+    if ((f.author || '') === o.value) o.selected = true;
+    authorSel.appendChild(o);
+  });
+  authorSel.onchange = e => f.author = e.target.value;
+
+  // Autocomplete de cliente
+  const clienteWrap = document.createElement('div');
+  clienteWrap.className = 'ac-wrap';
+
+  const clienteInp = document.createElement('input');
+  clienteInp.className = 'ac-input';
+  clienteInp.placeholder = '— buscar cliente';
+  clienteInp.value = f.cliente || '';
+  clienteInp.autocomplete = 'off';
+
+  const clienteList = document.createElement('div');
+  clienteList.className = 'ac-list';
+
+  let acActiveIdx = -1;
+
+  function renderAcList(filter) {
+    clienteList.innerHTML = '';
+    acActiveIdx = -1;
+    const filtered = CLIENTES.filter(c => c.toLowerCase().includes(filter.toLowerCase()));
+    if (filtered.length === 0 || filter === '') {
+      clienteList.classList.remove('open');
+      return;
+    }
+    filtered.forEach((nome, i) => {
+      const item = document.createElement('div');
+      item.className = 'ac-item';
+      item.textContent = nome;
+      item.onmousedown = e => {
+        e.preventDefault();
+        clienteInp.value = nome;
+        f.cliente = nome;
+        clienteList.classList.remove('open');
+      };
+      clienteList.appendChild(item);
+    });
+    clienteList.classList.add('open');
+  }
+
+  clienteInp.oninput = e => {
+    f.cliente = '';
+    renderAcList(e.target.value);
+  };
+
+  clienteInp.onkeydown = e => {
+    const items = clienteList.querySelectorAll('.ac-item');
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      acActiveIdx = Math.min(acActiveIdx + 1, items.length - 1);
+      items.forEach((el, i) => el.classList.toggle('active', i === acActiveIdx));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      acActiveIdx = Math.max(acActiveIdx - 1, 0);
+      items.forEach((el, i) => el.classList.toggle('active', i === acActiveIdx));
+    } else if (e.key === 'Enter' && acActiveIdx >= 0) {
+      e.preventDefault();
+      const chosen = items[acActiveIdx].textContent;
+      clienteInp.value = chosen;
+      f.cliente = chosen;
+      clienteList.classList.remove('open');
+    } else if (e.key === 'Escape') {
+      clienteList.classList.remove('open');
+    }
+  };
+
+  clienteInp.onblur = () => {
+    setTimeout(() => clienteList.classList.remove('open'), 150);
+    const match = CLIENTES.find(c => c.toLowerCase() === clienteInp.value.toLowerCase());
+    if (match) {
+      clienteInp.value = match;
+      f.cliente = match;
+      f.fundo = ''; f.banco = ''; f.cnpj = '';
+      popularFundos();
+      cnpjInp.value = ''; cnpjWrap.style.display = 'none';
+    } else if (!CLIENTES.includes(clienteInp.value)) {
+      clienteInp.value = f.cliente || '';
+    }
+  };
+
+  clienteWrap.appendChild(clienteInp);
+  clienteWrap.appendChild(clienteList);
+  const clienteSel = clienteWrap; // alias para manter compatibilidade com append abaixo
+
+  const fundoSel = document.createElement('select');
+
+  function popularFundos() {
+    fundoSel.innerHTML = '';
+    const def = document.createElement('option');
+    def.value = ''; def.textContent = '— selecione o fundo';
+    fundoSel.appendChild(def);
+
+    const isResgate = f.operation === 'resgate_total' || f.operation === 'resgate_parcial';
+    const clientePosicoes = f.cliente && isResgate ? (posicoes[f.cliente] || []) : null;
+
+    if (clientePosicoes && clientePosicoes.length > 0) {
+      clientePosicoes.forEach(item => {
+        const o = document.createElement('option');
+        o.value = item.produto;
+        o.textContent = item.produto;
+        o.dataset.banco = item.banco;
+        if ((f.fundo || '') === item.produto) o.selected = true;
+        fundoSel.appendChild(o);
+      });
+    } else {
+      Object.keys(FUNDOS).forEach(nome => {
+        const o = document.createElement('option');
+        o.value = nome; o.textContent = nome;
+        if ((f.fundo || '') === nome) o.selected = true;
+        fundoSel.appendChild(o);
+      });
+    }
+
+    const outroOpt = document.createElement('option');
+    outroOpt.value = '__outro__'; outroOpt.textContent = 'Outro…';
+    if (f._fundoOutro) outroOpt.selected = true;
+    fundoSel.appendChild(outroOpt);
+  }
+
+  popularFundos();
+
+  const fundoOutroInp = document.createElement('input');
+  fundoOutroInp.type = 'text';
+  fundoOutroInp.placeholder = 'Nome do fundo';
+  fundoOutroInp.value = f._fundoOutro || '';
+  fundoOutroInp.style.display = f._fundoOutro ? 'block' : 'none';
+  fundoOutroInp.oninput = e => { f._fundoOutro = e.target.value; f.fundo = e.target.value || 'Outro'; };
+
+  const cnpjWrap = document.createElement('div');
+  cnpjWrap.style.cssText = 'position:relative;display:' + (f.fundo && !f._fundoOutro ? 'block' : 'none');
+  const cnpjPrefix = document.createElement('span');
+  cnpjPrefix.textContent = 'CNPJ';
+  cnpjPrefix.style.cssText = 'position:absolute;left:9px;top:50%;transform:translateY(-50%);font-size:10px;font-weight:600;color:var(--text3);pointer-events:none;font-family:DM Sans,sans-serif;letter-spacing:.03em;';
+  const cnpjInp = document.createElement('input');
+  cnpjInp.type = 'text';
+  cnpjInp.readOnly = true;
+  cnpjInp.value = (f.fundo && !f._fundoOutro) ? (FUNDOS[f.fundo] || '') : '';
+  cnpjInp.style.cssText = 'padding-left:42px;background:var(--surface2);color:var(--text3);cursor:default;font-family:DM Mono,monospace;font-size:11px;';
+  cnpjWrap.appendChild(cnpjPrefix);
+  cnpjWrap.appendChild(cnpjInp);
+
+  fundoSel.onchange = e => {
+    const isOutro = e.target.value === '__outro__';
+    fundoOutroInp.style.display = isOutro ? 'block' : 'none';
+    if (isOutro) {
+      f._fundoOutro = fundoOutroInp.value || '';
+      f.fundo = f._fundoOutro || 'Outro';
+      f.cnpj = ''; f.banco = '';
+      cnpjInp.value = '';
+      cnpjWrap.style.display = 'none';
+    } else {
+      f._fundoOutro = '';
+      fundoOutroInp.value = '';
+      f.fundo = e.target.value;
+      f.cnpj = FUNDOS[f.fundo] || '';
+      cnpjInp.value = f.cnpj;
+      cnpjWrap.style.display = (f.fundo && FUNDOS[f.fundo]) ? 'block' : 'none';
+      // Preenche banco automaticamente pela posição do cliente
+      const selectedOpt = fundoSel.options[fundoSel.selectedIndex];
+      if (selectedOpt && selectedOpt.dataset.banco) {
+        f.banco = selectedOpt.dataset.banco;
+        bancoSel.value = f.banco;
+      }
+    }
+  };
+
+  const opSel = document.createElement('select');
+  [['', '— tipo de operação'], ['resgate_total', 'Resgate Total'], ['resgate_parcial', 'Resgate Parcial'], ['aplicacao', 'Aporte']].forEach(([v, l]) => {
+    const o = document.createElement('option');
+    o.value = v; o.textContent = l;
+    if ((f.operation || '') === v) o.selected = true;
+    opSel.appendChild(o);
+  });
+
+  const valueWrap = document.createElement('div');
+  valueWrap.style.cssText = 'position:relative;display:' + (['resgate_parcial','aplicacao'].includes(f.operation||'') ? 'block' : 'none');
+  const valuePrefix = document.createElement('span');
+  valuePrefix.textContent = 'R$';
+  valuePrefix.style.cssText = 'position:absolute;left:9px;top:50%;transform:translateY(-50%);font-size:12px;color:var(--text2);pointer-events:none;font-family:DM Sans,sans-serif;';
+  const valueInp = document.createElement('input');
+  valueInp.type = 'text';
+  valueInp.placeholder = '0,00';
+  valueInp.value = f.value || '';
+  valueInp.style.paddingLeft = '28px';
+  valueInp.oninput = e => {
+    const raw = e.target.value.replace(/[^0-9]/g, '');
+    const num = raw ? (parseInt(raw, 10) / 100) : '';
+    const fmt = num !== '' ? num.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '';
+    e.target.value = fmt;
+    f.value = fmt;
+  };
+  valueWrap.appendChild(valuePrefix);
+  valueWrap.appendChild(valueInp);
+
+  opSel.onchange = e => {
+    f.operation = e.target.value;
+    valueWrap.style.display = ['resgate_parcial','aplicacao'].includes(f.operation) ? 'block' : 'none';
+    if (!['resgate_parcial','aplicacao'].includes(f.operation)) { f.value = ''; valueInp.value = ''; }
+    f.fundo = ''; f.banco = ''; f.cnpj = '';
+    popularFundos();
+    cnpjInp.value = ''; cnpjWrap.style.display = 'none';
+  };
+
+  const bancoSel = document.createElement('select');
+  const bancoDefault = document.createElement('option');
+  bancoDefault.value = ''; bancoDefault.textContent = '— selecione o banco';
+  bancoSel.appendChild(bancoDefault);
+  ['XP INVESTIMENTOS', 'BANCO BTG PACTUAL', 'ITAÚ UNIBANCO', 'BRADESCO', 'SANTANDER', 'ICATU', 'BANCO DO BRASIL', 'UBS', 'BRL TRUST'].forEach(nome => {
+    const o = document.createElement('option');
+    o.value = nome; o.textContent = nome;
+    if ((f.banco || '') === nome) o.selected = true;
+    bancoSel.appendChild(o);
+  });
+  bancoSel.onchange = e => f.banco = e.target.value;
+
+  const row = document.createElement('div');
+  row.className = 'form-row';
+
+  const ok = document.createElement('button');
+  ok.className = 'btn-primary';
+  ok.textContent = 'Adicionar';
+  ok.onclick = () => saveCard(colId);
+
+  const ca = document.createElement('button');
+  ca.className = 'btn-ghost';
+  ca.textContent = 'Cancelar';
+  ca.onclick = () => { delete data.cardForms[colId]; render(); };
+
+  row.appendChild(ok); row.appendChild(ca);
+
+  const onshoreWrap = document.createElement('div');
+  onshoreWrap.style.cssText = 'display:' + (f.shore === 'onshore' ? 'flex' : 'none') + ';flex-direction:column;gap:7px;';
+  onshoreWrap.appendChild(opSel);
+  onshoreWrap.appendChild(valueWrap);
+  onshoreWrap.appendChild(fundoSel);
+  onshoreWrap.appendChild(fundoOutroInp);
+  onshoreWrap.appendChild(cnpjWrap);
+  onshoreWrap.appendChild(bancoSel);
+
+  const offshoreWrap = document.createElement('div');
+  offshoreWrap.style.cssText = 'display:' + (f.shore === 'offshore' ? 'flex' : 'none') + ';flex-direction:column;gap:7px;';
+
+  const offFundoSel = document.createElement('select');
+  const offFundoDef = document.createElement('option');
+  offFundoDef.value = ''; offFundoDef.textContent = '— selecione o fundo';
+  offFundoSel.appendChild(offFundoDef);
+  FUNDOS_OFFSHORE.forEach(nome => {
+    const o = document.createElement('option');
+    o.value = nome; o.textContent = nome;
+    if ((f.fundo || '') === nome) o.selected = true;
+    offFundoSel.appendChild(o);
+  });
+  const offOutroOpt = document.createElement('option');
+  offOutroOpt.value = '__outro__'; offOutroOpt.textContent = 'Outro…';
+  offFundoSel.appendChild(offOutroOpt);
+
+  const offFundoOutroInp = document.createElement('input');
+  offFundoOutroInp.type = 'text';
+  offFundoOutroInp.placeholder = 'Nome do fundo';
+  offFundoOutroInp.value = f._fundoOutro || '';
+  offFundoOutroInp.style.display = (f.shore === 'offshore' && f._fundoOutro) ? 'block' : 'none';
+  offFundoOutroInp.oninput = e => { f._fundoOutro = e.target.value; f.fundo = e.target.value || 'Outro'; };
+
+  offFundoSel.onchange = e => {
+    const isOutro = e.target.value === '__outro__';
+    offFundoOutroInp.style.display = isOutro ? 'block' : 'none';
+    if (isOutro) { f._fundoOutro = ''; f.fundo = 'Outro'; }
+    else { f._fundoOutro = ''; f.fundo = e.target.value; }
+  };
+
+  const offOpSel = document.createElement('select');
+  [['', '— tipo de operação'], ['resgate_total', 'Resgate Total'], ['resgate_parcial', 'Resgate Parcial'], ['aplicacao', 'Aporte']].forEach(([v, l]) => {
+    const o = document.createElement('option');
+    o.value = v; o.textContent = l;
+    if ((f.operation || '') === v) o.selected = true;
+    offOpSel.appendChild(o);
+  });
+
+  const offValueWrap = document.createElement('div');
+  offValueWrap.style.cssText = 'position:relative;display:' + (['resgate_parcial','aplicacao'].includes(f.operation||'') ? 'block' : 'none');
+  const offValuePrefix = document.createElement('span');
+  offValuePrefix.textContent = 'USD';
+  offValuePrefix.style.cssText = 'position:absolute;left:9px;top:50%;transform:translateY(-50%);font-size:12px;color:var(--text2);pointer-events:none;font-family:DM Sans,sans-serif;';
+  const offValueInp = document.createElement('input');
+  offValueInp.type = 'text';
+  offValueInp.placeholder = '0,00';
+  offValueInp.value = f.value || '';
+  offValueInp.style.paddingLeft = '40px';
+  offValueInp.oninput = e => {
+    const raw = e.target.value.replace(/[^0-9]/g, '');
+    const num = raw ? (parseInt(raw, 10) / 100) : '';
+    const fmt = num !== '' ? num.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '';
+    e.target.value = fmt;
+    f.value = fmt;
+  };
+  offValueWrap.appendChild(offValuePrefix);
+  offValueWrap.appendChild(offValueInp);
+
+  offOpSel.onchange = e => {
+    f.operation = e.target.value;
+    offValueWrap.style.display = ['resgate_parcial','aplicacao'].includes(f.operation) ? 'block' : 'none';
+    if (!['resgate_parcial','aplicacao'].includes(f.operation)) { f.value = ''; offValueInp.value = ''; }
+  };
+
+  offshoreWrap.appendChild(offFundoSel);
+  offshoreWrap.appendChild(offFundoOutroInp);
+  offshoreWrap.appendChild(offOpSel);
+  offshoreWrap.appendChild(offValueWrap);
+
+  wrap.appendChild(shoreToggle);
+  wrap.appendChild(authorSel);
+  wrap.appendChild(clienteSel);
+  wrap.appendChild(onshoreWrap);
+  wrap.appendChild(offshoreWrap);
+  wrap.appendChild(desc);
+  wrap.appendChild(row);
+
+  return wrap;
+}
+
+
+function nowStamp() {
+  const n = new Date();
+  const d = String(n.getDate()).padStart(2,'0');
+  const m = String(n.getMonth()+1).padStart(2,'0');
+  const y = String(n.getFullYear()).slice(-2);
+  const t = n.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  return `${d}/${m}/${y} ${t}`;
+}
+
+
+
+
+function currentUserEmail() {
+  const u = window._firebaseUser ? window._firebaseUser() : null;
+  return u ? u.email : '';
+}
+
+function addHistory(card, fromColName, toColName) {
+  if (!card.history) card.history = [];
+  card.history.push({ ts: nowStamp(), from: fromColName || null, to: toColName, user: currentUserEmail() });
+}
+
+function moveCardToCol(cardId, fromColId, toColId) {
+  const cols = getCols();
+  const fromCol = cols.find(c => c.id === fromColId);
+  const toCol = cols.find(c => c.id === toColId);
+  if (!fromCol || !toCol) return;
+  const idx = fromCol.cards.findIndex(c => c.id === cardId);
+  if (idx === -1) return;
+  const [card] = fromCol.cards.splice(idx, 1);
+  addHistory(card, fromCol.name, toCol.name);
+  toCol.cards.push(card);
+  render();
+}
+
+function formatValueInput(el) {
+  const raw = el.value.replace(/[^0-9]/g, '');
+  const num = raw ? (parseInt(raw, 10) / 100) : '';
+  const fmt = num !== '' ? num.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '';
+  el.value = fmt;
+}
+
+function formatCurrency(raw) {
+  const num = parseFloat(String(raw).replace(/\./g, '').replace(',', '.'));
+  if (isNaN(num)) return raw;
+  return num.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function saveCard(colId) {
+  if (!data.cardForms) data.cardForms = {};
+  const f = data.cardForms[colId];
+  // Gera título automático a partir do cliente e operação
+  const OP_AUTO = { resgate_total: 'Resgate Total', resgate_parcial: 'Resgate Parcial', aplicacao: 'Aporte' };
+  const autoTitle = [f.cliente, OP_AUTO[f.operation]].filter(Boolean).join(' — ') || 'Card';
+  f.title = autoTitle;
+
+  const col = getCols().find(c => c.id === colId);
+  if (col) {
+    const createdAt = new Date().toLocaleDateString('pt-BR');
+    let cotDate = '', liqDate = '';
+    if ((f.operation === 'resgate_total' || f.operation === 'resgate_parcial') && f.fundo) {
+      const dates = calcDates(createdAt, f.fundo);
+      if (dates) { cotDate = dates.cotDate; liqDate = dates.liqDate; }
+    }
+    const rawValue = f.value || '';
+    const newCard = {
+      id: uid(),
+      title: autoTitle,
+      desc: f.desc || '',
+      tag: f.tag || 'slate',
+      createdAt,
+      author: f.author || '',
+      cliente: f.cliente || '',
+      fundo: f.fundo || '',
+      cnpj: f.shore === 'offshore' ? '' : (f.cnpj || ''),
+      operation: f.operation || '',
+      value: rawValue ? formatCurrency(rawValue) : '',
+      cotDate: '',
+      liqDate: '',
+      banco: f.shore === 'offshore' ? '' : (f.banco || ''),
+      shore: f.shore || 'onshore',
+      history: []
+    };
+    addHistory(newCard, null, col.name);
+    col.cards.push(newCard);
+  }
+  delete data.cardForms[colId];
+
+  if (col) {
+    const cols = getCols();
+    const colIdx = cols.findIndex(c => c.id === colId);
+    if (colIdx !== -1 && colIdx < cols.length - 1) {
+      const card = col.cards[col.cards.length - 1];
+      const nextCol = cols[colIdx + 1];
+      col.cards.splice(col.cards.length - 1, 1);
+      addHistory(card, col.name, nextCol.name);
+      nextCol.cards.push(card);
+    }
+  }
+
+  render();
+  save();
+}
+
+function addCol() {
+  const n = (data.newColName || '').trim();
+  if (!n) return;
+  getCols().push({ id: uid(), name: n, cards: [] });
+  data.addColForm = false;
+  data.newColName = '';
+  render();
+}
+
+/* DRAG & DROP */
+function dropCard(toColId, beforeCardId) {
+  if (!dragCardId) return;
+  let card = null;
+  let fromColName = '';
+  getCols().forEach(col => {
+    const i = col.cards.findIndex(c => c.id === dragCardId);
+    if (i > -1) { card = col.cards.splice(i, 1)[0]; fromColName = col.name; }
+  });
+  if (!card) return;
+  const toCol = getCols().find(c => c.id === toColId);
+  if (!toCol) return;
+  addHistory(card, fromColName, toCol.name);
+  if (beforeCardId) {
+    const i = toCol.cards.findIndex(c => c.id === beforeCardId);
+    toCol.cards.splice(i > -1 ? i : toCol.cards.length, 0, card);
+  } else {
+    toCol.cards.push(card);
+  }
+  render();
+  save();
+}
+
+/* EDIT MODAL */
+function openEdit(card, colId) {
+  editTarget = { card, colId };
+  document.getElementById('editTitle').value = card.title;
+  document.getElementById('editDesc').value = card.desc || '';
+  document.getElementById('editTag').value = card.tag || 'slate';
+  document.getElementById('editAuthor').value = card.author || '';
+  document.getElementById('editCliente').value = card.cliente || '';
+  document.getElementById('editOperation').value = card.operation || '';
+  document.getElementById('editValue').value = card.value || '';
+  toggleEditValue();
+  document.getElementById('editBanco').value = card.banco || '';
+
+  const fundoSelect = document.getElementById('editFundo');
+  const fundoOutro = document.getElementById('editFundoOutro');
+  const knownFundos = Array.from(fundoSelect.options).map(o => o.value).filter(v => v && v !== '__outro__');
+  if (card.fundo && !knownFundos.includes(card.fundo)) {
+    fundoSelect.value = '__outro__';
+    fundoOutro.value = card.fundo;
+  } else {
+    fundoSelect.value = card.fundo || '';
+    fundoOutro.value = '';
+  }
+
+  updateEditCnpj();
+  refreshEditDates();
+  const shore = card.shore || 'onshore';
+  setEditShore(shore);
+
+  // Preenche campos offshore
+  if (shore === 'offshore') {
+    const offFundoSel = document.getElementById('editFundoOffshore');
+    const knownOff = Array.from(offFundoSel.options).map(o => o.value).filter(v => v && v !== '__outro__');
+    if (card.fundo && !knownOff.includes(card.fundo)) {
+      offFundoSel.value = '__outro__';
+      document.getElementById('editFundoOffshoreOutro').value = card.fundo;
+      document.getElementById('editFundoOffshoreOutroWrap').style.display = 'block';
+    } else {
+      offFundoSel.value = card.fundo || '';
+      document.getElementById('editFundoOffshoreOutroWrap').style.display = 'none';
+    }
+    document.getElementById('editOperationOffshore').value = card.operation || '';
+    document.getElementById('editValueOffshore').value = card.value || '';
+    const showVal = ['resgate_parcial','aplicacao'].includes(card.operation || '');
+    document.getElementById('editValueOffshoreWrap').style.display = showVal ? 'block' : 'none';
+  }
+
+  document.getElementById('editModal').classList.add('open');
+  setTimeout(() => document.getElementById('editTitle').focus(), 50);
+}
+
+function closeModal() {
+  document.getElementById('editModal').classList.remove('open');
+  editTarget = null;
+}
+
+function saveEdit() {
+  if (!editTarget) return;
+  const t = document.getElementById('editTitle').value.trim();
+  if (!t) return;
+  editTarget.card.title = t;
+  editTarget.card.desc = document.getElementById('editDesc').value.trim();
+  editTarget.card.tag = document.getElementById('editTag').value;
+  editTarget.card.author = document.getElementById('editAuthor').value;
+  editTarget.card.cliente = document.getElementById('editCliente').value;
+  editTarget.card.shore = document.getElementById('editShoreOffshore').classList.contains('active') ? 'offshore' : 'onshore';
+
+  if (editTarget.card.shore === 'offshore') {
+    const offFundoVal = document.getElementById('editFundoOffshore').value;
+    const offIsOutro = offFundoVal === '__outro__';
+    editTarget.card.fundo = offIsOutro
+      ? (document.getElementById('editFundoOffshoreOutro').value.trim() || 'Outro')
+      : offFundoVal;
+    editTarget.card.operation = document.getElementById('editOperationOffshore').value;
+    const offRaw = ['resgate_parcial','aplicacao'].includes(editTarget.card.operation)
+      ? document.getElementById('editValueOffshore').value.trim() : '';
+    editTarget.card.value = offRaw ? formatCurrency(offRaw) : '';
+    editTarget.card.banco = '';
+    editTarget.card.cnpj = '';
+    editTarget.card.cotDate = '';
+    editTarget.card.liqDate = '';
+  } else {
+    editTarget.card.operation = document.getElementById('editOperation').value;
+    const rawValue = ['resgate_parcial','aplicacao'].includes(editTarget.card.operation) ? document.getElementById('editValue').value.trim() : '';
+    editTarget.card.value = rawValue ? formatCurrency(rawValue) : '';
+    editTarget.card.banco = document.getElementById('editBanco').value;
+    const fundoSel = document.getElementById('editFundo').value;
+    const isOutro = fundoSel === '__outro__';
+    editTarget.card.fundo = isOutro
+      ? (document.getElementById('editFundoOutro').value.trim() || 'Outro')
+      : fundoSel;
+    editTarget.card.cnpj = isOutro ? '' : (FUNDOS[editTarget.card.fundo] || '');
+    if (!isOutro && (editTarget.card.operation === 'resgate_total' || editTarget.card.operation === 'resgate_parcial') && editTarget.card.fundo && editTarget.card.createdAt) {
+      const dates = calcDates(editTarget.card.createdAt, editTarget.card.fundo);
+      if (dates) { editTarget.card.cotDate = dates.cotDate; editTarget.card.liqDate = dates.liqDate; }
+    } else {
+      editTarget.card.cotDate = ''; editTarget.card.liqDate = '';
+    }
+  }
+
+  closeModal();
+  render();
+  save();
+}
+
+function deleteFromModal() {
+  if (!editTarget) return;
+  if (!confirm('Excluir este card?')) return;
+  let found = false;
+  getCols().forEach(col => {
+    const i = col.cards.findIndex(c => c.id === editTarget.card.id);
+    if (i > -1) { col.cards.splice(i, 1); found = true; }
+  });
+  closeModal();
+  if (found) render();
+}
+
+document.getElementById('editModal').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeModal();
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModal();
+});
+
+/* ── TOGGLE ONSHORE / OFFSHORE ── */
+function setEditShore(shore) {
+  document.getElementById('editShoreOnshore').classList.toggle('active', shore === 'onshore');
+  document.getElementById('editShoreOffshore').classList.toggle('active', shore === 'offshore');
+  document.getElementById('editOnshoreFields').style.display = shore === 'onshore' ? 'block' : 'none';
+  document.getElementById('editOffshoreFields').style.display = shore === 'offshore' ? 'block' : 'none';
+  if (editTarget) editTarget.card.shore = shore;
+}
+
+document.getElementById('editFundoOffshore').addEventListener('change', function() {
+  const isOutro = this.value === '__outro__';
+  document.getElementById('editFundoOffshoreOutroWrap').style.display = isOutro ? 'block' : 'none';
+});
+
+document.getElementById('editOperationOffshore').addEventListener('change', function() {
+  const show = ['resgate_parcial','aplicacao'].includes(this.value);
+  document.getElementById('editValueOffshoreWrap').style.display = show ? 'block' : 'none';
+  if (!show) document.getElementById('editValueOffshore').value = '';
+});
+
+function toggleEditValue() {
+  const op = document.getElementById('editOperation').value;
+  const show = ['resgate_parcial','aplicacao'].includes(op);
+  document.getElementById('editValueWrap').style.display = show ? 'block' : 'none';
+  if (!show) document.getElementById('editValue').value = '';
+  refreshEditDates();
+}
+
+function updateEditCnpj() {
+  const fundo = document.getElementById('editFundo').value;
+  const isOutro = fundo === '__outro__';
+  document.getElementById('editFundoOutroWrap').style.display = isOutro ? 'block' : 'none';
+  if (!isOutro) document.getElementById('editFundoOutro').value = '';
+  const cnpj = (!isOutro && fundo) ? (FUNDOS[fundo] || '') : '';
+  document.getElementById('editCnpj').value = cnpj;
+  document.getElementById('editCnpjWrap').style.display = (!isOutro && fundo) ? 'block' : 'none';
+  refreshEditDates();
+}
+
+function refreshEditDates() {
+  const op = document.getElementById('editOperation').value;
+  const fundo = document.getElementById('editFundo').value;
+  const wrap = document.getElementById('editDatesWrap');
+  const isResgate = op === 'resgate_total' || op === 'resgate_parcial';
+  const isOutro = fundo === '__outro__';
+  if (!isOutro && isResgate && fundo && editTarget && editTarget.card.createdAt) {
+    const dates = calcDates(editTarget.card.createdAt, fundo);
+    if (dates) {
+      document.getElementById('editCotDate').value = dates.cotDate;
+      document.getElementById('editLiqDate').value = dates.liqDate;
+      wrap.style.display = 'flex';
+      return;
+    }
+  }
+  wrap.style.display = 'none';
+}
+
+/* ── XLSX EXPORT ── */
+async function exportCol(col) {
+  if (col.cards.length === 0) { alert('Nenhum card para exportar.'); return; }
+  if (!confirm(`Exportar ${col.cards.length} card(s) e avançar para a próxima etapa?`)) return;
+
+  // Resgate Total e Parcial → "Resgate"; Aporte → "Aporte"
+  const OP_LABELS = { resgate_total: 'Resgate', resgate_parcial: 'Resgate', aplicacao: 'Aporte' };
+  const headers = ['Data','Tipo','Operação','Cliente','Bco','Ag','Conta','Tipo Conta Turim','Produto','Quantidade','PU','Total','Valor','IR','Interna','Classificação','Observação','Evento','Data de Cotização','Data de Liquidação','Bco Destino','Ag Destino','Conta Destino','Tipo Conta Turim Destino','Produto Destino','Data de Cotização','Data de Liquidação','Tipo Confirmação','Tipo Assinatura','CHECK'];
+
+  // Converte DD/MM/YY ou DD/MM/YYYY para número serial do Excel
+  function dateToSerial(str) {
+    if (!str) return null;
+    const p = str.split('/');
+    if (p.length !== 3) return null;
+    const d = parseInt(p[0]), m = parseInt(p[1]);
+    const y = p[2].length === 2 ? 2000 + parseInt(p[2]) : parseInt(p[2]);
+    const date = new Date(y, m - 1, d);
+    // Serial do Excel: dias desde 1900-01-01 (com bug do ano bissexto 1900)
+    const epoch = new Date(1899, 11, 30);
+    const serial = Math.round((date - epoch) / 86400000);
+    return serial;
+  }
+
+  function fmtValor(str) {
+    if (!str) return '';
+    const n = parseFloat(String(str).replace(/\./g, '').replace(',', '.'));
+    return isNaN(n) ? '' : String(Math.round(n));
+  }
+
+  // Índices das colunas de data (0-based): Data=0, CotDate=18, LiqDate=19, CotDate2=25, LiqDate2=26
+  const DATE_COLS = new Set([0, 18, 19, 25, 26]);
+
+  const dataRows = col.cards.map(card => {
+    const isResgateTotal = card.operation === 'resgate_total';
+    const operacao = OP_LABELS[card.operation] || card.operation || '';
+    const total = isResgateTotal ? 'SIM' : '';
+    const valor = isResgateTotal ? '' : fmtValor(card.value || '');
+    return [
+      card.createdAt||'',   // 0 - Data (será serial)
+      'TURIM',              // 1
+      operacao,             // 2
+      card.cliente||'',     // 3
+      card.banco||'',       // 4
+      '','',                // 5,6
+      'Gestão',             // 7
+      card.fundo||'',       // 8
+      '','',                // 9,10
+      total,                // 11
+      valor,                // 12
+      '','Não','','','',    // 13-17
+      card.cotDate||'',     // 18
+      card.liqDate||'',     // 19
+      '','','','','',       // 20-24
+      card.cotDate||'',     // 25
+      card.liqDate||'',     // 26
+      '','',''              // 27-29
+    ];
+  });
+
+  const allRows = [['Boleta Cliente'],[],headers,...dataRows];
+
+  const ss=[]; const ssIdx={};
+  function si(v){const s=String(v);if(ssIdx[s]===undefined){ssIdx[s]=ss.length;ss.push(s);}return ssIdx[s];}
+  function esc(v){return String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  function cn(n){let s='';for(n++;n>0;n=Math.floor((n-1)/26))s=String.fromCharCode(((n-1)%26)+65)+s;return s;}
+
+  // Estilo de data: numFmtId=14 (DD/MM/YYYY)
+  const stylesXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+    '<numFmts count="1"><numFmt numFmtId="164" formatCode="DD/MM/YYYY"/></numFmts>' +
+    '<fonts count="1"><font><sz val="11"/><name val="Arial"/></font></fonts>' +
+    '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>' +
+    '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
+    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+    '<cellXfs count="2">' +
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
+    '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>' +
+    '</cellXfs>' +
+    '</styleSheet>';
+
+  // DATA_ROW_START: linha das datas começa na linha 4 (0-indexed: row 3), que é a primeira linha de dados
+  const DATA_ROW_START = 3; // allRows[0]=Boleta, [1]=vazia, [2]=headers, [3..]=dados
+
+  let shXml='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>';
+  allRows.forEach((row,ri)=>{
+    let cells='';
+    row.forEach((cell,ci)=>{
+      const v=(cell===null||cell===undefined)?'':String(cell);
+      if(!v) return;
+      const isDataRow = ri >= DATA_ROW_START;
+      const isDateCol = DATE_COLS.has(ci);
+      if(isDataRow && isDateCol) {
+        const serial = dateToSerial(v);
+        if(serial) {
+          cells+=`<c r="${cn(ci)}${ri+1}" s="1"><v>${serial}</v></c>`;
+          return;
+        }
+      }
+      cells+=`<c r="${cn(ci)}${ri+1}" t="s"><v>${si(v)}</v></c>`;
+    });
+    if(cells)shXml+=`<row r="${ri+1}">${cells}</row>`;
+  });
+  shXml+='</sheetData></worksheet>';
+
+  let ssXml=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="${ss.length}" uniqueCount="${ss.length}">`;
+  ss.forEach(s=>{ssXml+=`<si><t xml:space="preserve">${esc(s)}</t></si>`;});
+  ssXml+='</sst>';
+
+  const wbXml='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Template" sheetId="1" r:id="rId1"/></sheets></workbook>';
+  const wbRels='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>';
+  const rels='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>';
+  const ct='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>';
+
+  const te = new TextEncoder();
+  const files = [
+    {name:'[Content_Types].xml', data:te.encode(ct)},
+    {name:'_rels/.rels', data:te.encode(rels)},
+    {name:'xl/workbook.xml', data:te.encode(wbXml)},
+    {name:'xl/_rels/workbook.xml.rels', data:te.encode(wbRels)},
+    {name:'xl/worksheets/sheet1.xml', data:te.encode(shXml)},
+    {name:'xl/sharedStrings.xml', data:te.encode(ssXml)},
+    {name:'xl/styles.xml', data:te.encode(stylesXml)},
+  ];
+
+  function crc32(buf){
+    let c=0xFFFFFFFF;
+    const t=new Uint32Array(256);
+    for(let i=0;i<256;i++){let x=i;for(let j=0;j<8;j++)x=(x&1)?(0xEDB88320^(x>>>1)):(x>>>1);t[i]=x;}
+    for(let i=0;i<buf.length;i++)c=t[(c^buf[i])&0xFF]^(c>>>8);
+    return(c^0xFFFFFFFF)>>>0;
+  }
+
+  function w16(v){return new Uint8Array([v&0xff,(v>>8)&0xff]);}
+  function w32(v){return new Uint8Array([v&0xff,(v>>8)&0xff,(v>>16)&0xff,(v>>24)&0xff]);}
+  function concat(...arrays){
+    const total=arrays.reduce((s,a)=>s+a.length,0);
+    const out=new Uint8Array(total);let off=0;
+    arrays.forEach(a=>{out.set(a,off);off+=a.length;});
+    return out;
+  }
+
+  const localParts=[], centralParts=[];
+  let offset=0;
+
+  files.forEach(({name,data})=>{
+    const nb=te.encode(name);
+    const crc=crc32(data);
+    const sz=data.length;
+    const lh=concat(
+      new Uint8Array([0x50,0x4B,0x03,0x04]),
+      w16(20),w16(0),w16(0),
+      w16(0),w16(0),
+      w32(crc),w32(sz),w32(sz),
+      w16(nb.length),w16(0),
+      nb, data
+    );
+    const cd=concat(
+      new Uint8Array([0x50,0x4B,0x01,0x02]),
+      w16(20),w16(20),w16(0),w16(0),
+      w16(0),w16(0),
+      w32(crc),w32(sz),w32(sz),
+      w16(nb.length),w16(0),w16(0),
+      w16(0),w16(0),
+      w32(0),
+      w32(offset),
+      nb
+    );
+    localParts.push(lh);
+    centralParts.push(cd);
+    offset+=lh.length;
+  });
+
+  const cdSize=centralParts.reduce((s,a)=>s+a.length,0);
+  const eocd=concat(
+    new Uint8Array([0x50,0x4B,0x05,0x06]),
+    w16(0),w16(0),
+    w16(files.length),w16(files.length),
+    w32(cdSize),w32(offset),
+    w16(0)
+  );
+
+  const zip=concat(...localParts,...centralParts,eocd);
+  const blob=new Blob([zip],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  const ds=new Date().toLocaleDateString('pt-BR').replace(/\//g,'');
+  a.href=url; a.download=`Boleta_${ds}.xlsx`;
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{URL.revokeObjectURL(url);a.remove();},1000);
+
+  gerarTabelaVisual(col.cards, ds);
+
+  const cols=getCols();
+  const colIdx=cols.findIndex(c=>c.id===col.id);
+  if(colIdx!==-1&&colIdx<cols.length-1){
+    const nextCol=cols[colIdx+1];
+    col.cards.forEach(card=>{addHistory(card,col.name,nextCol.name);nextCol.cards.push(card);});
+    col.cards=[];
+  }
+  render();
+  save();
+}
+
+/* ── TABELA VISUAL PARA EMAIL ── */
+function gerarTabelaVisual(cards, ds) {
+  const OP_LABELS = { resgate_total: 'Resgate', resgate_parcial: 'Resgate', aplicacao: 'Aporte' };
+
+  const rows = cards.map(card => [
+    card.createdAt || '',
+    OP_LABELS[card.operation] || card.operation || '',
+    card.cliente || '',
+    card.banco || '',
+    card.fundo || '',
+    card.operation === 'resgate_total' ? '' : (card.value || ''),
+    '',
+    ''
+  ]);
+
+  const cols = ['Data','Tipo','Cliente','Banco','Ativo','Valor','Origem/Destino Liquidez','Observações'];
+
+  const tableHtml = `
+    <table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;width:100%">
+      <thead>
+        <tr>${cols.map(c=>`<th style="border:1px solid #ccc;padding:7px 12px;background:#f5f5f5;font-weight:600;text-align:left;white-space:nowrap">${c}</th>`).join('')}</tr>
+      </thead>
+      <tbody>
+        ${rows.map(r=>`<tr>${r.map(cell=>`<td style="border:1px solid #ccc;padding:6px 12px;white-space:nowrap">${cell}</td>`).join('')}</tr>`).join('')}
+      </tbody>
+    </table>
+  `;
+
+  let overlay = document.getElementById('tabelaEmailModal');
+  if (overlay) overlay.remove();
+
+  overlay = document.createElement('div');
+  overlay.id = 'tabelaEmailModal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:300;display:flex;align-items:center;justify-content:center;';
+
+  const box = document.createElement('div');
+  box.style.cssText = 'background:#fff;border-radius:10px;padding:28px;max-width:92vw;max-height:85vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.18);display:flex;flex-direction:column;gap:16px;';
+
+  const title = document.createElement('div');
+  title.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:16px;';
+  title.innerHTML = `<span style="font-family:DM Sans,sans-serif;font-size:15px;font-weight:600">Tabela para e-mail</span>`;
+
+  const btnRow = document.createElement('div');
+  btnRow.style.cssText = 'display:flex;gap:8px;';
+
+  const btnCopy = document.createElement('button');
+  btnCopy.textContent = 'Copiar tabela';
+  btnCopy.style.cssText = 'padding:7px 16px;background:#1c1b18;color:#fff;border:none;border-radius:6px;font-size:13px;font-family:DM Sans,sans-serif;cursor:pointer;font-weight:500;';
+  btnCopy.onclick = () => {
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    const range = document.createRange();
+    range.selectNodeContents(preview);
+    sel.addRange(range);
+    document.execCommand('copy');
+    sel.removeAllRanges();
+    btnCopy.textContent = '✓ Copiado!';
+    setTimeout(() => btnCopy.textContent = 'Copiar tabela', 2000);
+  };
+
+  const btnClose = document.createElement('button');
+  btnClose.textContent = 'Fechar';
+  btnClose.style.cssText = 'padding:7px 14px;background:none;border:1px solid #e2e0d8;border-radius:6px;font-size:13px;font-family:DM Sans,sans-serif;cursor:pointer;color:#6b6860;';
+  btnClose.onclick = () => overlay.remove();
+
+  btnRow.appendChild(btnCopy);
+  btnRow.appendChild(btnClose);
+  title.appendChild(btnRow);
+
+  const preview = document.createElement('div');
+  preview.innerHTML = tableHtml;
+
+  box.appendChild(title);
+  box.appendChild(preview);
+  overlay.appendChild(box);
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
+}
+
+/* ── UPLOAD DE LIQUIDAÇÕES ── */
+function processarLiquidacoes(input) {
+  const file = input.files[0];
+  if (!file) return;
+  input.value = '';
+
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const wb = XLSX.read(e.target.result, { type: 'array' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+      if (!rows.length) { alert('Arquivo vazio ou sem dados.'); return; }
+
+      const colKey = (row, ...names) => {
+        const keys = Object.keys(row);
+        for (const n of names) {
+          const found = keys.find(k => k.trim().toLowerCase() === n.toLowerCase());
+          if (found !== undefined) return row[found];
+        }
+        return '';
+      };
+
+      const liquidadas = rows.filter(row => {
+        const status = String(colKey(row, 'Status', 'status', 'STATUS') || '').trim().toLowerCase();
+        return status === 'liquidado' || status === 'liquidada';
+      });
+
+      if (!liquidadas.length) {
+        alert('Nenhuma linha com Status "Liquidado" encontrada no arquivo.');
+        return;
+      }
+
+      function normVal(v) {
+        if (v === null || v === undefined || v === '') return null;
+        if (typeof v === 'number') return isNaN(v) ? null : Math.abs(v);
+        let s = String(v).replace(/R\$\s*/g,'').trim();
+        if (s.includes(',')) { s = s.replace(/\./g,'').replace(',','.'); }
+        const n = parseFloat(s);
+        return isNaN(n) ? null : Math.abs(n);
+      }
+
+      function norm(s) {
+        return String(s || '').trim().toLowerCase().replace(/\s+/g,' ').normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+      }
+
+      function tipoMatch(tipoArq, tipoCard) {
+        const t = String(tipoArq || '').trim().toUpperCase();
+        const c = String(tipoCard || '').trim().toLowerCase();
+        if (t === 'A') return c === 'aplicacao';
+        if (t === 'R') return c === 'resgate_total' || c === 'resgate_parcial';
+        return false;
+      }
+
+      let matched = 0, notFound = [];
+
+      liquidadas.forEach(row => {
+        const rCliente = norm(colKey(row, 'Cliente', 'cliente', 'CLIENTE'));
+        const rAtivo   = norm(colKey(row, 'Ativo', 'ativo', 'ATIVO', 'Fundo', 'fundo', 'FUNDO'));
+        const rValor   = normVal(colKey(row, 'Valor', 'valor', 'VALOR'));
+        const rTipo    = String(colKey(row, 'Tipo', 'tipo', 'TIPO') || '').trim().toUpperCase();
+
+        let foundCard = null, foundFromCol = null, foundBoard = null;
+
+        data.boards.forEach(board => {
+          const cols = data.cols[board.id] || [];
+          cols.forEach(col => {
+            if (col._resgatado) return;
+            col.cards.forEach(card => {
+              if (foundCard) return;
+              const cCliente = norm(card.cliente);
+              const cAtivo   = norm(card.fundo);
+              const cValor   = normVal(card.value);
+              const cTipo    = card.operation || '';
+
+              const clienteOk = cCliente === rCliente;
+              const ativoOk   = cAtivo === rAtivo;
+              const valorOk   = rValor !== null && cValor !== null && Math.abs(rValor - cValor) < 0.05;
+              const tipoOk    = tipoMatch(rTipo, cTipo);
+
+              if (clienteOk && ativoOk && valorOk && tipoOk) {
+                foundCard = card;
+                foundFromCol = col;
+                foundBoard = board;
+              }
+            });
+          });
+        });
+
+        if (foundCard && foundFromCol && foundBoard) {
+          const cols = data.cols[foundBoard.id];
+          const colIdx = cols.findIndex(c => c.id === foundFromCol.id);
+          if (colIdx !== -1 && colIdx < cols.length - 1) {
+            const nextCol = cols[colIdx + 1];
+            const cardIdx = foundFromCol.cards.findIndex(c => c.id === foundCard.id);
+            if (cardIdx !== -1) {
+              const [moved] = foundFromCol.cards.splice(cardIdx, 1);
+              addHistory(moved, foundFromCol.name, nextCol.name);
+              nextCol.cards.push(moved);
+              matched++;
+            }
+          }
+        } else {
+          notFound.push(`${rCliente} | ${rAtivo} | ${rValor} | Tipo: ${rTipo}`);
+        }
+      });
+
+      render();
+      save();
+      mostrarResultadoUpload(liquidadas.length, matched, notFound);
+
+    } catch(err) {
+      alert('Erro ao ler o arquivo: ' + err.message);
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function mostrarResultadoUpload(total, matched, notFound) {
+  let overlay = document.getElementById('uploadResultModal');
+  if (overlay) overlay.remove();
+
+  overlay = document.createElement('div');
+  overlay.id = 'uploadResultModal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:300;display:flex;align-items:center;justify-content:center;';
+
+  const box = document.createElement('div');
+  box.style.cssText = 'background:#fff;border-radius:10px;padding:28px;width:420px;max-width:92vw;max-height:80vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.18);display:flex;flex-direction:column;gap:14px;font-family:DM Sans,sans-serif;';
+
+  const title = document.createElement('div');
+  title.style.cssText = 'font-size:15px;font-weight:600;';
+  title.textContent = 'Resultado — Liquidações';
+  box.appendChild(title);
+
+  const summary = document.createElement('div');
+  summary.style.cssText = 'display:flex;gap:10px;';
+  summary.innerHTML = `
+    <div style="flex:1;background:#e6f4ec;border:1px solid #a8d9b8;border-radius:8px;padding:12px;text-align:center;">
+      <div style="font-size:22px;font-weight:700;color:#1e6e42;">${matched}</div>
+      <div style="font-size:11px;color:#1e6e42;margin-top:2px;">Cards avançados</div>
+    </div>
+    <div style="flex:1;background:${notFound.length ? '#fff5f5' : '#f5f5f5'};border:1px solid ${notFound.length ? '#f5b8b8' : '#e2e0d8'};border-radius:8px;padding:12px;text-align:center;">
+      <div style="font-size:22px;font-weight:700;color:${notFound.length ? '#b94040' : '#a09d96'};">${notFound.length}</div>
+      <div style="font-size:11px;color:${notFound.length ? '#b94040' : '#a09d96'};margin-top:2px;">Não encontrados</div>
+    </div>
+  `;
+  box.appendChild(summary);
+
+  if (notFound.length) {
+    const label = document.createElement('div');
+    label.style.cssText = 'font-size:11px;font-weight:600;color:#6b6860;text-transform:uppercase;letter-spacing:.05em;';
+    label.textContent = 'Não encontrados:';
+    box.appendChild(label);
+
+    const list = document.createElement('div');
+    list.style.cssText = 'display:flex;flex-direction:column;gap:4px;max-height:200px;overflow-y:auto;';
+    notFound.forEach(item => {
+      const row = document.createElement('div');
+      row.style.cssText = 'font-size:12px;color:#6b6860;background:#f5f4f0;border-radius:5px;padding:6px 10px;font-family:DM Mono,monospace;';
+      row.textContent = item;
+      list.appendChild(row);
+    });
+    box.appendChild(list);
+  }
+
+  const btn = document.createElement('button');
+  btn.textContent = 'Fechar';
+  btn.style.cssText = 'padding:8px;background:#1c1b18;color:#fff;border:none;border-radius:6px;font-size:13px;font-family:DM Sans,sans-serif;cursor:pointer;font-weight:500;';
+  btn.onclick = () => overlay.remove();
+  box.appendChild(btn);
+
+  overlay.appendChild(box);
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
+}
+
+// ── UPLOAD DE POSIÇÕES ──
+function uploadPosicoes(input) {
+  const file = input.files[0];
+  if (!file) return;
+  input.value = '';
+
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const data = new Uint8Array(e.target.result);
+      const wb = XLSX.read(data, { type: 'array' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+      if (!rows.length) { alert('Arquivo vazio.'); return; }
+
+      const nova = {};
+      rows.forEach(row => {
+        const cliente = String(row['numero_cliente'] || '').trim();
+        const produto = String(row['produto'] || '').trim();
+        const banco   = String(row['nome_banco'] || '').trim();
+        if (!cliente || !produto) return;
+        if (!nova[cliente]) nova[cliente] = [];
+        const existe = nova[cliente].find(p => p.produto === produto && p.banco === banco);
+        if (!existe) nova[cliente].push({ produto, banco });
+      });
+
+      posicoes = nova;
+
+      // Salva no Firebase
+      if (window._firebaseSavePosicoes) window._firebaseSavePosicoes(nova);
+
+      const total = Object.keys(nova).length;
+      const badge = document.getElementById('posicoesBadge');
+      if (badge) {
+        badge.style.display = 'inline-block';
+        badge.textContent = '📊 ' + total + ' clientes';
+        badge.title = 'Atualizado em ' + new Date().toLocaleDateString('pt-BR');
+      }
+      alert('Base atualizada! ' + total + ' clientes carregados.');
+    } catch(err) {
+      alert('Erro ao ler arquivo: ' + err.message);
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+// setInterval removido
+</script>
+</body>
+</html>
