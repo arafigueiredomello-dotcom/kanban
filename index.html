@@ -35,7 +35,7 @@ let currentUser = null;
 let remoteData = null;
 let isSaving = false;
 let pendingSave = null;
-const CODE_VERSION = 3;
+const CODE_VERSION = 4;
 
 // ── AUTH STATE ──
 onAuthStateChanged(auth, user => {
@@ -226,7 +226,7 @@ onValue(ref(db, 'posicoes'), snapshot => {
 </script>
 <style>
   :root {
-    --bg: #f5f4f0;
+    --bg: #dbeafe;
     --surface: #ffffff;
     --surface2: #f0efe9;
     --border: #e2e0d8;
@@ -2213,12 +2213,7 @@ function currentUserEmail() {
 function addHistory(card, fromColName, toColName) {
   if (!card.history) card.history = [];
   card.history.push({ ts: nowStamp(), from: fromColName || null, to: toColName, user: currentUserEmail() });
-  if (toColName && toColName.toLowerCase().includes('resgat') && fromColName) {
-    const err = new Error();
-    const stack = err.stack || '';
-    const lines = stack.split('\n').slice(1, 6).join('\n');
-    alert('INDO PARA RESGATADO!\n\nCard: ' + card.title + '\nDe: ' + fromColName + '\n\nStack:\n' + lines);
-  }
+
 }
 
 function moveCardToCol(cardId, fromColId, toColId) {
@@ -2276,8 +2271,8 @@ function saveCard(colId) {
       cnpj: f.shore === 'offshore' ? '' : (f.cnpj || ''),
       operation: f.operation || '',
       value: rawValue ? formatCurrency(rawValue) : '',
-      cotDate: cotDate,
-      liqDate: liqDate,
+      cotDate: '',
+      liqDate: '',
       banco: f.shore === 'offshore' ? '' : (f.banco || ''),
       shore: f.shore || 'onshore',
       history: []
@@ -2292,12 +2287,11 @@ function saveCard(colId) {
     const colIdx = cols.findIndex(c => c.id === colId);
     if (colIdx !== -1 && colIdx < cols.length - 1) {
       const nextCol = cols[colIdx + 1];
-      const lastCard = col.cards[col.cards.length - 1];
-      const isResgate = lastCard && (lastCard.operation === 'resgate_total' || lastCard.operation === 'resgate_parcial');
-      if (!nextCol._resgatado && !isResgate) {
+      if (!nextCol._resgatado) {
+        const card = col.cards[col.cards.length - 1];
         col.cards.splice(col.cards.length - 1, 1);
-        addHistory(lastCard, col.name, nextCol.name);
-        nextCol.cards.push(lastCard);
+        addHistory(card, col.name, nextCol.name);
+        nextCol.cards.push(card);
       }
     }
   }
