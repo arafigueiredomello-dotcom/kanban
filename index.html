@@ -2271,8 +2271,8 @@ function saveCard(colId) {
       cnpj: f.shore === 'offshore' ? '' : (f.cnpj || ''),
       operation: f.operation || '',
       value: rawValue ? formatCurrency(rawValue) : '',
-      cotDate: '',
-      liqDate: '',
+      cotDate: cotDate,
+      liqDate: liqDate,
       banco: f.shore === 'offshore' ? '' : (f.banco || ''),
       shore: f.shore || 'onshore',
       history: []
