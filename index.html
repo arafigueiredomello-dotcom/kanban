@@ -1138,7 +1138,7 @@ onValue(ref(db, 'posicoes'), snapshot => {
         <option>T18 - NWG</option><option>T1943 - GAPR</option><option>T1943 - GIPR</option>
         <option>T1943 - PPR</option><option>T1943 - RPR</option><option>T2653 - EKT</option>
         <option>T2653 - ETT</option><option>T2653 - LT</option><option>T2653 - MT</option>
-        <option>T2653 - PT</option><option>T2653 - HAN</option><option>T29 - DIF</option>
+        <option>T2653 - PT</option><option>T2653 - HAN</option><option>T2653 - ST</option><option>T2024 - LPP</option><option>T5151 - RB</option><option>T5151 - RMC</option><option>T29 - DIF</option>
         <option>T29 - JKF</option><option>T29 - JKSA</option><option>T501 - DML</option>
         <option>T501 - JL</option><option>T501 - ML</option><option>T57 - ACF</option>
         <option>T712 - RB</option><option>T7677 - CP</option><option>T7677 - SSM</option>
@@ -1315,7 +1315,7 @@ const FUNDOS_INFO = {
 };
 const FUNDOS = Object.fromEntries(Object.entries(FUNDOS_INFO).map(([k,v]) => [k, v.cnpj]));
 
-const CLIENTES = ['T08 - ALM','T08 - FLM','T08 - LMA','T101 - DML','T101 - LML','T101 - MML','T129 - RS','T18 - DN','T18 - NBP','T18 - NWG','T1943 - GAPR','T1943 - GIPR','T1943 - PPR','T1943 - RPR','T2653 - EKT','T2653 - ETT','T2653 - LT','T2653 - MT','T2653 - PT','T2653 - HAN','T29 - DIF','T29 - JKF','T29 - JKSA','T501 - DML','T501 - JL','T501 - ML','T57 - ACF','T712 - RB','T7677 - CP','T7677 - SSM','T771 - ABO','T8484 - RDC','T858 - FC','T858 - VC','T8816 - LG','T8846 - AR','T8846 - ER','T98 - CONSULTORIA','T98 - LEGADO'];
+const CLIENTES = ['T08 - ALM','T08 - FLM','T08 - LMA','T101 - DML','T101 - LML','T101 - MML','T129 - RS','T18 - DN','T18 - NBP','T18 - NWG','T1943 - GAPR','T1943 - GIPR','T1943 - PPR','T1943 - RPR','T2653 - EKT','T2653 - ETT','T2653 - LT','T2653 - MT','T2653 - PT','T2653 - HAN','T2653 - ST','T2024 - LPP','T5151 - RB','T5151 - RMC','T29 - DIF','T29 - JKF','T29 - JKSA','T501 - DML','T501 - JL','T501 - ML','T57 - ACF','T712 - RB','T7677 - CP','T7677 - SSM','T771 - ABO','T8484 - RDC','T858 - FC','T858 - VC','T8816 - LG','T8846 - AR','T8846 - ER','T98 - CONSULTORIA','T98 - LEGADO'];
 
 /* ── FERIADOS E DATAS ── */
 function getEaster(year) {
