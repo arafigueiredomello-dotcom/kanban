@@ -137,6 +137,8 @@ function startListening() {
         data.showNewBoard = false;
         data.newBoardName = '';
         data.newColName = '';
+        // Garantir que arquivados seja array
+        if (!Array.isArray(data.arquivados)) data.arquivados = data.arquivados ? Object.values(data.arquivados) : [];
         if (!data.boards || data.boards.length === 0) {
           data.boards = JSON.parse(JSON.stringify(INITIAL_DATA.boards));
         }
@@ -185,6 +187,7 @@ function saveToFirebase() {
     boards: data.boards,
     activeBoard: data.activeBoard,
     cols: data.cols,
+    arquivados: data.arquivados || [],
     _v: CODE_VERSION
   };
   set(ref(db, 'kanban'), toSave).then(() => {
@@ -1077,6 +1080,7 @@ onValue(ref(db, 'posicoes'), snapshot => {
     <span id="posicoesBadge" style="display:none;font-size:11px;color:#1e6e42;background:#e6f4ec;border:1px solid #a8d9b8;border-radius:20px;padding:3px 10px;font-family:DM Mono,monospace;"></span>
     <input type="file" id="posicoesInput" accept=".xlsx,.xls" style="display:none" onchange="uploadPosicoes(this)">
     <button class="btn-icon" title="Upload base de posições (Excel)" onclick="document.getElementById('posicoesInput').click()">📊</button>
+    <button class="btn-icon" title="Histórico de arquivados" onclick="abrirHistoricoArquivado()">📁</button>
     <span class="user-badge" id="userEmail"></span>
     <button class="btn-icon" title="Sair" onclick="doLogout()">⎋</button>
   </div>
@@ -1608,6 +1612,29 @@ function buildCol(col) {
     liqBtn.style.fontSize = '10px';
     liqBtn.onclick = () => uploadInput.click();
     hdr.appendChild(liqBtn);
+  }
+  
+  // Botão "Limpar Resgatado" — arquiva cards com liqDate vencida
+  if (col._resgatado) {
+    const limparBtn = document.createElement('button');
+    limparBtn.className = 'col-export-btn';
+    limparBtn.textContent = '🗄 Limpar vencidos';
+    limparBtn.title = 'Arquiva cards cuja data de liquidação já passou';
+    limparBtn.style.marginLeft = '4px';
+    limparBtn.style.padding = '2px 6px';
+    limparBtn.style.fontSize = '10px';
+    limparBtn.onclick = () => abrirModalLimparResgatado(col);
+    hdr.appendChild(limparBtn);
+    
+    // Badge com quantos estão elegíveis para arquivamento
+    const elegiveisCount = col.cards.filter(card => cardLiqDateVencida(card)).length;
+    if (elegiveisCount > 0) {
+      const badge = document.createElement('span');
+      badge.textContent = elegiveisCount;
+      badge.title = `${elegiveisCount} card${elegiveisCount!==1?'s':''} com liquidação vencida`;
+      badge.style.cssText = 'margin-left:4px;padding:1px 6px;background:#b94040;color:#fff;font-size:10px;font-weight:600;border-radius:10px;font-family:DM Mono,monospace;';
+      hdr.appendChild(badge);
+    }
   }
 
   hdr.appendChild(menuBtn);
@@ -2785,7 +2812,93 @@ function gerarTabelaVisual(cards, ds) {
   btnClose.style.cssText = 'padding:7px 14px;background:none;border:1px solid #e2e0d8;border-radius:6px;font-size:13px;font-family:DM Sans,sans-serif;cursor:pointer;color:#6b6860;';
   btnClose.onclick = () => overlay.remove();
 
+  // Outlook Desktop — Opção D-1: copia tabela HTML E abre Outlook via mailto: vazio
+  const btnOutlookFmt = document.createElement('button');
+  btnOutlookFmt.textContent = '📧 Outlook (formatado)';
+  btnOutlookFmt.title = 'Copia a tabela formatada e abre o Outlook em janela nova. Use Ctrl+V no corpo do e-mail.';
+  btnOutlookFmt.style.cssText = 'padding:7px 14px;background:#0078d4;color:#fff;border:none;border-radius:6px;font-size:13px;font-family:DM Sans,sans-serif;cursor:pointer;font-weight:500;';
+  btnOutlookFmt.onclick = () => {
+    // Copia tabela para clipboard
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    const range = document.createRange();
+    range.selectNodeContents(preview);
+    sel.addRange(range);
+    let copyOk = false;
+    try { copyOk = document.execCommand('copy'); } catch(e) { copyOk = false; }
+    sel.removeAllRanges();
+    
+    // Monta o subject sugerido
+    const hoje = new Date().toLocaleDateString('pt-BR');
+    const subject = encodeURIComponent(`Boletas ${hoje}`);
+    const body = encodeURIComponent(`Prezados,\n\nSegue abaixo a relação de boletas do dia ${hoje}.\n\n[Cole a tabela aqui com Ctrl+V]\n\nObrigado,`);
+    
+    // Abre Outlook Desktop via mailto: (Windows associa mailto: ao Outlook Desktop por padrão)
+    window.location.href = `mailto:?subject=${subject}&body=${body}`;
+    
+    // Feedback visual
+    if (copyOk) {
+      btnOutlookFmt.textContent = '✓ Tabela copiada — cole com Ctrl+V';
+      setTimeout(() => btnOutlookFmt.textContent = '📧 Outlook (formatado)', 3500);
+    } else {
+      btnOutlookFmt.textContent = '⚠ Falha ao copiar';
+      setTimeout(() => btnOutlookFmt.textContent = '📧 Outlook (formatado)', 2500);
+    }
+  };
+
+  // Outlook Desktop — Opção D-2: mailto com tabela em texto plano no corpo
+  const btnOutlookTxt = document.createElement('button');
+  btnOutlookTxt.textContent = '📧 Outlook (texto plano)';
+  btnOutlookTxt.title = 'Abre o Outlook com a tabela em texto puro já no corpo. Perde formatação mas não precisa colar.';
+  btnOutlookTxt.style.cssText = 'padding:7px 14px;background:none;color:#0078d4;border:1px solid #0078d4;border-radius:6px;font-size:13px;font-family:DM Sans,sans-serif;cursor:pointer;font-weight:500;';
+  btnOutlookTxt.onclick = () => {
+    // Constrói tabela em texto plano (separado por tab + quebra de linha)
+    const headers = Array.from(preview.querySelectorAll('thead th')).map(th => th.textContent.trim());
+    const bodyRows = Array.from(preview.querySelectorAll('tbody tr')).map(tr =>
+      Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim())
+    );
+    
+    // Calcula largura de cada coluna para alinhar
+    const widths = headers.map((h, i) => {
+      let max = h.length;
+      bodyRows.forEach(r => { if (r[i] && r[i].length > max) max = r[i].length; });
+      return max;
+    });
+    
+    function padRow(arr) {
+      return arr.map((cell, i) => (cell || '').padEnd(widths[i])).join('  ');
+    }
+    
+    const sepLine = widths.map(w => '─'.repeat(w)).join('  ');
+    const lines = [
+      padRow(headers),
+      sepLine,
+      ...bodyRows.map(padRow),
+    ];
+    const plainTable = lines.join('\n');
+    
+    const hoje = new Date().toLocaleDateString('pt-BR');
+    const subject = encodeURIComponent(`Boletas ${hoje}`);
+    const body = encodeURIComponent(
+      `Prezados,\n\nSegue abaixo a relação de boletas do dia ${hoje}.\n\n${plainTable}\n\nObrigado,`
+    );
+    
+    // mailto tem limite de ~2000 caracteres em muitos clientes — avisa se estourar
+    const mailtoUrl = `mailto:?subject=${subject}&body=${body}`;
+    if (mailtoUrl.length > 8000) {
+      alert('Tabela muito grande para mailto (> 8000 caracteres).\nUse a opção "Outlook (formatado)" em vez desta.');
+      return;
+    }
+    
+    window.location.href = mailtoUrl;
+    
+    btnOutlookTxt.textContent = '✓ Abrindo Outlook...';
+    setTimeout(() => btnOutlookTxt.textContent = '📧 Outlook (texto plano)', 2500);
+  };
+
   btnRow.appendChild(btnCopy);
+  btnRow.appendChild(btnOutlookFmt);
+  btnRow.appendChild(btnOutlookTxt);
   btnRow.appendChild(btnClose);
   title.appendChild(btnRow);
 
@@ -2823,13 +2936,21 @@ function processarLiquidacoes(input) {
         return '';
       };
 
+      // Status do arquivo que disparam movimento do card para Resgatado
+      function statusValido(status) {
+        const s = String(status || '').trim().toLowerCase();
+        return s === 'enviado' || s === 'enviada'
+            || s === 'boletado no adm'
+            || s === 'liquidado' || s === 'liquidada';
+      }
+
       const liquidadas = rows.filter(row => {
         const status = String(colKey(row, 'Status', 'status', 'STATUS') || '').trim().toLowerCase();
-        return status === 'liquidado' || status === 'liquidada';
+        return statusValido(status);
       });
 
       if (!liquidadas.length) {
-        alert('Nenhuma linha com Status "Liquidado" encontrada no arquivo.');
+        alert('Nenhuma linha com status "Enviado", "Boletado no Adm" ou "Liquidada" encontrada no arquivo.');
         return;
       }
 
@@ -2845,6 +2966,34 @@ function processarLiquidacoes(input) {
       function norm(s) {
         return String(s || '').trim().toLowerCase().replace(/\s+/g,' ').normalize('NFD').replace(/[\u0300-\u036f]/g,'');
       }
+      
+      // Normalização TOLERANTE para nomes de fundos:
+      // - aplica tudo do norm()
+      // - remove sufixos comuns: FIM CP, FIC FIM, FIC RF, FIC, FIM, RF, CP, RFC
+      // - converte LIMITADA → LTDA
+      // - remove pontuação (exceto letras/números/espaços)
+      // - remove hífens, pontos
+      function normTolerante(s) {
+        let n = norm(s);
+        // Substituições antes de remover sufixos
+        n = n.replace(/\blimitada\b/g, 'ltda');
+        n = n.replace(/\bresponsabilidade\b/g, 'resp');
+        // Remove pontuação (exceto espaços e alfanuméricos)
+        n = n.replace(/[^a-z0-9 ]/g, ' ');
+        // Remove sufixos comuns de fundos no final (iterativamente)
+        const sufixos = ['fim cp', 'fim rf', 'fic cp', 'fic rf', 'fic fim', 'fic fif', 'cic rf', 'fif rf', 'rf cp', 'fim', 'fic', 'fif', 'cic', 'rfc', 'rf', 'cp', 'ltda', 'resp', 'multi'];
+        let prev = '';
+        while (prev !== n) {
+          prev = n;
+          for (const suf of sufixos) {
+            const re = new RegExp('\\s+' + suf + '\\s*$');
+            n = n.replace(re, '');
+          }
+        }
+        // Colapsa espaços novamente
+        n = n.replace(/\s+/g, ' ').trim();
+        return n;
+      }
 
       function tipoMatch(tipoArq, tipoCard) {
         const t = String(tipoArq || '').trim().toUpperCase();
@@ -2854,20 +3003,36 @@ function processarLiquidacoes(input) {
         return false;
       }
 
-      let matched = 0, notFound = [];
+      let matched = 0;
+      let matchedExatos = 0;
+      let matchedTolerantes = 0;
+      let notFound = [];
+      let alreadyResgatado = [];   // já estava em Resgatado, não fez nada
+      let toleranteDetalhes = [];  // lista dos casos onde tolerância salvou
 
       liquidadas.forEach(row => {
+        const rStatus  = String(colKey(row, 'Status', 'status', 'STATUS') || '').trim().toLowerCase();
         const rCliente = norm(colKey(row, 'Cliente', 'cliente', 'CLIENTE'));
-        const rAtivo   = norm(colKey(row, 'Ativo', 'ativo', 'ATIVO', 'Fundo', 'fundo', 'FUNDO'));
+        const rAtivoOriginal = colKey(row, 'Ativo', 'ativo', 'ATIVO', 'Fundo', 'fundo', 'FUNDO');
+        const rAtivo   = norm(rAtivoOriginal);
+        const rAtivoTol= normTolerante(rAtivoOriginal);
         const rValor   = normVal(colKey(row, 'Valor', 'valor', 'VALOR'));
         const rTipo    = String(colKey(row, 'Tipo', 'tipo', 'TIPO') || '').trim().toUpperCase();
 
         let foundCard = null, foundFromCol = null, foundBoard = null;
+        let foundTolerante = false;
+        let foundCardOriginal = '';
 
+        // Helper para normalizar nome de coluna (remove acentos)
+        function normColName(name) {
+          return String(name || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        }
+
+        // PRIMEIRA PASSADA: matching estrito — APENAS na coluna "Concluído"
         data.boards.forEach(board => {
           const cols = data.cols[board.id] || [];
           cols.forEach(col => {
-            if (col._resgatado) return;
+            if (normColName(col.name) !== 'concluido') return;  // só Concluído
             col.cards.forEach(card => {
               if (foundCard) return;
               const cCliente = norm(card.cliente);
@@ -2884,32 +3049,107 @@ function processarLiquidacoes(input) {
                 foundCard = card;
                 foundFromCol = col;
                 foundBoard = board;
+                foundCardOriginal = card.fundo;
               }
             });
           });
         });
+        
+        // SEGUNDA PASSADA: matching tolerante — APENAS na coluna "Concluído"
+        if (!foundCard) {
+          data.boards.forEach(board => {
+            const cols = data.cols[board.id] || [];
+            cols.forEach(col => {
+              if (normColName(col.name) !== 'concluido') return;  // só Concluído
+              col.cards.forEach(card => {
+                if (foundCard) return;
+                const cCliente = norm(card.cliente);
+                const cAtivoTol= normTolerante(card.fundo);
+                const cValor   = normVal(card.value);
+                const cTipo    = card.operation || '';
 
+                const clienteOk = cCliente === rCliente;
+                const ativoOk   = cAtivoTol === rAtivoTol && rAtivoTol.length > 3; // evita match em strings vazias/muito curtas
+                const valorOk   = rValor !== null && cValor !== null && Math.abs(rValor - cValor) < 0.05;
+                const tipoOk    = tipoMatch(rTipo, cTipo);
+
+                if (clienteOk && ativoOk && valorOk && tipoOk) {
+                  foundCard = card;
+                  foundFromCol = col;
+                  foundBoard = board;
+                  foundCardOriginal = card.fundo;
+                  foundTolerante = true;
+                }
+              });
+            });
+          });
+        }
+
+        // Se não encontrou em Concluído, verifica se já está em Resgatado
+        // (operação já processada em upload anterior — não é erro, só informativo)
+        if (!foundCard) {
+          data.boards.forEach(board => {
+            const cols = data.cols[board.id] || [];
+            cols.forEach(col => {
+              if (!col._resgatado) return;  // só Resgatado
+              col.cards.forEach(card => {
+                if (foundCard) return;
+                const cCliente = norm(card.cliente);
+                const cAtivo   = norm(card.fundo);
+                const cAtivoTol= normTolerante(card.fundo);
+                const cValor   = normVal(card.value);
+                const cTipo    = card.operation || '';
+
+                const clienteOk = cCliente === rCliente;
+                const ativoOk   = (cAtivo === rAtivo) || (cAtivoTol === rAtivoTol && rAtivoTol.length > 3);
+                const valorOk   = rValor !== null && cValor !== null && Math.abs(rValor - cValor) < 0.05;
+                const tipoOk    = tipoMatch(rTipo, cTipo);
+
+                if (clienteOk && ativoOk && valorOk && tipoOk) {
+                  alreadyResgatado.push(`${rCliente} | ${rAtivoOriginal} | ${rValor} | Status: ${rStatus}`);
+                  foundCard = card;  // marca pra não cair em notFound
+                }
+              });
+            });
+          });
+          // Se foi achado em Resgatado, sai da iteração (não é match nem notFound)
+          if (foundCard && !foundFromCol) return;
+        }
+
+        // Se encontrou card em Concluído, move para Resgatado (a última coluna)
         if (foundCard && foundFromCol && foundBoard) {
           const cols = data.cols[foundBoard.id];
-          const colIdx = cols.findIndex(c => c.id === foundFromCol.id);
-          if (colIdx !== -1 && colIdx < cols.length - 1) {
-            const nextCol = cols[colIdx + 1];
+          // Coluna Resgatado = última coluna (tem flag _resgatado)
+          const destCol = cols.find(c => c._resgatado);
+          
+          if (destCol) {
             const cardIdx = foundFromCol.cards.findIndex(c => c.id === foundCard.id);
             if (cardIdx !== -1) {
               const [moved] = foundFromCol.cards.splice(cardIdx, 1);
-              addHistory(moved, foundFromCol.name, nextCol.name);
-              nextCol.cards.push(moved);
+              addHistory(moved, foundFromCol.name, destCol.name);
+              destCol.cards.push(moved);
               matched++;
+              if (foundTolerante) {
+                matchedTolerantes++;
+                toleranteDetalhes.push(`Arquivo: "${rAtivoOriginal}" → Card: "${foundCardOriginal}" (cliente ${rCliente}) | Status: ${rStatus}`);
+              } else {
+                matchedExatos++;
+              }
             }
           }
         } else {
-          notFound.push(`${rCliente} | ${rAtivo} | ${rValor} | Tipo: ${rTipo}`);
+          notFound.push(`${rCliente} | ${rAtivoOriginal} | ${rValor} | Tipo: ${rTipo} | Status: ${rStatus}`);
         }
       });
 
       render();
       save();
-      mostrarResultadoUpload(liquidadas.length, matched, notFound);
+      mostrarResultadoUpload(liquidadas.length, matched, notFound, {
+        matchedExatos,
+        matchedTolerantes,
+        toleranteDetalhes,
+        alreadyResgatado,
+      });
 
     } catch(err) {
       alert('Erro ao ler o arquivo: ' + err.message);
@@ -2918,7 +3158,253 @@ function processarLiquidacoes(input) {
   reader.readAsArrayBuffer(file);
 }
 
-function mostrarResultadoUpload(total, matched, notFound) {
+/* ── LIMPAR RESGATADO — ARQUIVAR CARDS COM LIQUIDAÇÃO VENCIDA ── */
+
+// Parsea liqDate (formato dd/mm/aaaa ou variações) e retorna Date ou null
+function parseLiqDate(s) {
+  if (!s) return null;
+  s = String(s).trim();
+  // Formato dd/mm/aaaa
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (m) {
+    let [, d, mo, y] = m;
+    if (y.length === 2) y = '20' + y;
+    const dt = new Date(parseInt(y), parseInt(mo)-1, parseInt(d));
+    return isNaN(dt.getTime()) ? null : dt;
+  }
+  // Fallback: deixa o Date parsear direto (ISO ou similar)
+  const dt = new Date(s);
+  return isNaN(dt.getTime()) ? null : dt;
+}
+
+// Checa se a liqDate do card já passou (<= hoje)
+function cardLiqDateVencida(card) {
+  const dt = parseLiqDate(card.liqDate);
+  if (!dt) return false;  // sem data definida = não mexe
+  const hoje = new Date();
+  hoje.setHours(0,0,0,0);
+  return dt <= hoje;
+}
+
+// Modal de confirmação antes de arquivar
+function abrirModalLimparResgatado(col) {
+  const elegiveis = col.cards.filter(cardLiqDateVencida);
+  
+  if (elegiveis.length === 0) {
+    alert('Nenhum card em Resgatado tem data de liquidação vencida.\n\nApenas cards com "LIQUIDAÇÃO" <= hoje são arquivados. Cards sem data de liquidação preenchida não são afetados.');
+    return;
+  }
+  
+  let overlay = document.getElementById('limparResgatadoModal');
+  if (overlay) overlay.remove();
+  
+  overlay = document.createElement('div');
+  overlay.id = 'limparResgatadoModal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:300;display:flex;align-items:center;justify-content:center;';
+  
+  const box = document.createElement('div');
+  box.style.cssText = 'background:#fff;border-radius:10px;padding:28px;width:560px;max-width:92vw;max-height:85vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.18);display:flex;flex-direction:column;gap:14px;font-family:DM Sans,sans-serif;';
+  
+  const title = document.createElement('div');
+  title.style.cssText = 'font-size:15px;font-weight:600;';
+  title.textContent = `Arquivar ${elegiveis.length} card${elegiveis.length!==1?'s':''} de "Resgatado"`;
+  box.appendChild(title);
+  
+  const desc = document.createElement('div');
+  desc.style.cssText = 'font-size:12px;color:#6b6860;line-height:1.5;';
+  desc.innerHTML = `Cards com <strong>data de liquidação já vencida</strong> (<= hoje) serão movidos para o histórico arquivado. Continuam salvos no Firebase e podem ser consultados, mas somem do Kanban. <br><br><strong>Total no Kanban:</strong> ${col.cards.length} cards em Resgatado<br><strong>Sem data ou data futura:</strong> ${col.cards.length - elegiveis.length} (não serão afetados)<br><strong>A arquivar:</strong> ${elegiveis.length}`;
+  box.appendChild(desc);
+  
+  // Lista dos cards que serão arquivados
+  const listLabel = document.createElement('div');
+  listLabel.style.cssText = 'font-size:11px;font-weight:600;color:#6b6860;text-transform:uppercase;letter-spacing:.05em;margin-top:4px;';
+  listLabel.textContent = 'Cards a arquivar:';
+  box.appendChild(listLabel);
+  
+  const list = document.createElement('div');
+  list.style.cssText = 'display:flex;flex-direction:column;gap:4px;max-height:240px;overflow-y:auto;border:1px solid #e2e0d8;border-radius:6px;padding:8px;';
+  elegiveis.forEach(card => {
+    const row = document.createElement('div');
+    row.style.cssText = 'font-size:11px;color:#6b6860;background:#f5f4f0;border-radius:4px;padding:6px 10px;font-family:DM Mono,monospace;display:flex;justify-content:space-between;gap:8px;';
+    const left = document.createElement('div');
+    left.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+    left.textContent = `${card.cliente || '?'} | ${card.fundo || '?'} | R$ ${card.value || '?'}`;
+    const right = document.createElement('div');
+    right.style.cssText = 'color:#b94040;font-weight:600;flex-shrink:0;';
+    right.textContent = `Liq: ${card.liqDate}`;
+    row.appendChild(left);
+    row.appendChild(right);
+    list.appendChild(row);
+  });
+  box.appendChild(list);
+  
+  // Botões de ação
+  const btnRow = document.createElement('div');
+  btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:8px;';
+  
+  const btnCancel = document.createElement('button');
+  btnCancel.textContent = 'Cancelar';
+  btnCancel.style.cssText = 'padding:8px 16px;background:none;border:1px solid #e2e0d8;border-radius:6px;font-size:13px;font-family:DM Sans,sans-serif;cursor:pointer;color:#6b6860;';
+  btnCancel.onclick = () => overlay.remove();
+  
+  const btnConfirm = document.createElement('button');
+  btnConfirm.textContent = `Arquivar ${elegiveis.length} card${elegiveis.length!==1?'s':''}`;
+  btnConfirm.style.cssText = 'padding:8px 16px;background:#b94040;color:#fff;border:none;border-radius:6px;font-size:13px;font-family:DM Sans,sans-serif;cursor:pointer;font-weight:500;';
+  btnConfirm.onclick = () => {
+    executarLimpezaResgatado(col, elegiveis);
+    overlay.remove();
+  };
+  
+  btnRow.appendChild(btnCancel);
+  btnRow.appendChild(btnConfirm);
+  box.appendChild(btnRow);
+  
+  overlay.appendChild(box);
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
+}
+
+// Executa o arquivamento: remove do col, adiciona em data.arquivados
+function executarLimpezaResgatado(col, elegiveis) {
+  if (!data.arquivados) data.arquivados = [];
+  
+  const timestamp = new Date().toISOString();
+  const arquivadorEmail = (currentUser && currentUser.email) || 'desconhecido';
+  
+  elegiveis.forEach(card => {
+    // Enriquece com metadados de arquivamento
+    const arquivado = {
+      ...card,
+      _archivedAt: timestamp,
+      _archivedBy: arquivadorEmail,
+      _archivedFromCol: col.name,
+    };
+    data.arquivados.push(arquivado);
+  });
+  
+  // Remove os arquivados da coluna
+  const idsArquivados = new Set(elegiveis.map(c => c.id));
+  col.cards = col.cards.filter(c => !idsArquivados.has(c.id));
+  
+  render();
+  save();
+  
+  // Feedback
+  setTimeout(() => {
+    alert(`✓ ${elegiveis.length} card${elegiveis.length!==1?'s':''} arquivado${elegiveis.length!==1?'s':''}.\n\nPara consultar o histórico, use o botão "Histórico" no cabeçalho do app.`);
+  }, 100);
+}
+
+// Modal de consulta ao histórico arquivado
+function abrirHistoricoArquivado() {
+  const arquivados = (data.arquivados || []).slice().reverse(); // mais recentes primeiro
+  
+  let overlay = document.getElementById('historicoModal');
+  if (overlay) overlay.remove();
+  
+  overlay = document.createElement('div');
+  overlay.id = 'historicoModal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:300;display:flex;align-items:center;justify-content:center;';
+  
+  const box = document.createElement('div');
+  box.style.cssText = 'background:#fff;border-radius:10px;padding:28px;width:800px;max-width:94vw;max-height:85vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.18);display:flex;flex-direction:column;gap:14px;font-family:DM Sans,sans-serif;';
+  
+  const title = document.createElement('div');
+  title.style.cssText = 'display:flex;justify-content:space-between;align-items:center;';
+  title.innerHTML = `<span style="font-size:15px;font-weight:600;">Histórico de arquivados (${arquivados.length})</span>`;
+  
+  const btnClose = document.createElement('button');
+  btnClose.textContent = 'Fechar';
+  btnClose.style.cssText = 'padding:7px 14px;background:none;border:1px solid #e2e0d8;border-radius:6px;font-size:13px;font-family:DM Sans,sans-serif;cursor:pointer;color:#6b6860;';
+  btnClose.onclick = () => overlay.remove();
+  title.appendChild(btnClose);
+  box.appendChild(title);
+  
+  if (arquivados.length === 0) {
+    const empty = document.createElement('div');
+    empty.style.cssText = 'padding:24px;text-align:center;color:#a09d96;font-size:13px;';
+    empty.textContent = 'Nenhum card foi arquivado ainda. Use o botão "Limpar vencidos" na coluna Resgatado para arquivar cards cuja liquidação já ocorreu.';
+    box.appendChild(empty);
+  } else {
+    // Tabela de arquivados
+    const table = document.createElement('table');
+    table.style.cssText = 'border-collapse:collapse;width:100%;font-size:12px;';
+    table.innerHTML = `
+      <thead>
+        <tr style="background:#f5f4f0;">
+          <th style="border:1px solid #e2e0d8;padding:6px 10px;text-align:left;font-weight:600;">Arquivado em</th>
+          <th style="border:1px solid #e2e0d8;padding:6px 10px;text-align:left;font-weight:600;">Cliente</th>
+          <th style="border:1px solid #e2e0d8;padding:6px 10px;text-align:left;font-weight:600;">Ativo</th>
+          <th style="border:1px solid #e2e0d8;padding:6px 10px;text-align:right;font-weight:600;">Valor</th>
+          <th style="border:1px solid #e2e0d8;padding:6px 10px;text-align:left;font-weight:600;">Liq.</th>
+          <th style="border:1px solid #e2e0d8;padding:6px 10px;text-align:left;font-weight:600;">Op.</th>
+          <th style="border:1px solid #e2e0d8;padding:6px 10px;text-align:left;font-weight:600;">Por</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    `;
+    const tbody = table.querySelector('tbody');
+    const OP_LABELS = { resgate_total: 'Resg. Total', resgate_parcial: 'Resg. Parc.', aplicacao: 'Aporte' };
+    arquivados.forEach(c => {
+      const tr = document.createElement('tr');
+      const archDate = c._archivedAt ? new Date(c._archivedAt).toLocaleString('pt-BR') : '';
+      tr.innerHTML = `
+        <td style="border:1px solid #e2e0d8;padding:5px 10px;color:#6b6860;font-family:DM Mono,monospace;font-size:11px;">${archDate}</td>
+        <td style="border:1px solid #e2e0d8;padding:5px 10px;">${c.cliente || '—'}</td>
+        <td style="border:1px solid #e2e0d8;padding:5px 10px;font-family:DM Mono,monospace;font-size:11px;">${c.fundo || '—'}</td>
+        <td style="border:1px solid #e2e0d8;padding:5px 10px;text-align:right;font-family:DM Mono,monospace;">${c.value || '—'}</td>
+        <td style="border:1px solid #e2e0d8;padding:5px 10px;font-family:DM Mono,monospace;font-size:11px;">${c.liqDate || '—'}</td>
+        <td style="border:1px solid #e2e0d8;padding:5px 10px;font-size:11px;">${OP_LABELS[c.operation] || c.operation || ''}</td>
+        <td style="border:1px solid #e2e0d8;padding:5px 10px;font-size:11px;color:#6b6860;">${c._archivedBy || '—'}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+    box.appendChild(table);
+    
+    // Botão de exportar para xlsx
+    const exportBtn = document.createElement('button');
+    exportBtn.textContent = '📥 Exportar histórico (xlsx)';
+    exportBtn.style.cssText = 'padding:8px 14px;background:#1c1b18;color:#fff;border:none;border-radius:6px;font-size:13px;font-family:DM Sans,sans-serif;cursor:pointer;font-weight:500;align-self:flex-start;';
+    exportBtn.onclick = () => exportarHistorico(arquivados);
+    box.appendChild(exportBtn);
+  }
+  
+  overlay.appendChild(box);
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
+}
+
+// Exporta o histórico arquivado para xlsx
+function exportarHistorico(arquivados) {
+  const rows = arquivados.map(c => ({
+    'Arquivado em': c._archivedAt || '',
+    'Arquivado por': c._archivedBy || '',
+    'Origem': c._archivedFromCol || '',
+    'Criado em': c.createdAt || '',
+    'Autor': c.author || '',
+    'Cliente': c.cliente || '',
+    'Banco': c.banco || '',
+    'Ativo': c.fundo || '',
+    'CNPJ': c.cnpj || '',
+    'Operação': c.operation || '',
+    'Valor': c.value || '',
+    'Data Cotização': c.cotDate || '',
+    'Data Liquidação': c.liqDate || '',
+  }));
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Arquivados');
+  const ds = new Date().toISOString().slice(0,10);
+  XLSX.writeFile(wb, `Historico_Arquivados_${ds}.xlsx`);
+}
+
+function mostrarResultadoUpload(total, matched, notFound, opts) {
+  opts = opts || {};
+  const matchedExatos = opts.matchedExatos || 0;
+  const matchedTolerantes = opts.matchedTolerantes || 0;
+  const toleranteDetalhes = opts.toleranteDetalhes || [];
+  const alreadyResgatado = opts.alreadyResgatado || [];
+  
   let overlay = document.getElementById('uploadResultModal');
   if (overlay) overlay.remove();
 
@@ -2927,41 +3413,110 @@ function mostrarResultadoUpload(total, matched, notFound) {
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:300;display:flex;align-items:center;justify-content:center;';
 
   const box = document.createElement('div');
-  box.style.cssText = 'background:#fff;border-radius:10px;padding:28px;width:420px;max-width:92vw;max-height:80vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.18);display:flex;flex-direction:column;gap:14px;font-family:DM Sans,sans-serif;';
+  box.style.cssText = 'background:#fff;border-radius:10px;padding:28px;width:560px;max-width:92vw;max-height:85vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.18);display:flex;flex-direction:column;gap:14px;font-family:DM Sans,sans-serif;';
 
   const title = document.createElement('div');
   title.style.cssText = 'font-size:15px;font-weight:600;';
   title.textContent = 'Resultado — Liquidações';
   box.appendChild(title);
 
+  const subtitle = document.createElement('div');
+  subtitle.style.cssText = 'font-size:12px;color:#6b6860;margin-top:-6px;';
+  subtitle.textContent = `${total} linhas "Liquidada" no arquivo processadas`;
+  box.appendChild(subtitle);
+
+  // Grid de KPIs: 3 cards (matched, já resgatados, não encontrados)
   const summary = document.createElement('div');
-  summary.style.cssText = 'display:flex;gap:10px;';
+  summary.style.cssText = 'display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;';
   summary.innerHTML = `
-    <div style="flex:1;background:#e6f4ec;border:1px solid #a8d9b8;border-radius:8px;padding:12px;text-align:center;">
+    <div style="background:#e6f4ec;border:1px solid #a8d9b8;border-radius:8px;padding:12px;text-align:center;">
       <div style="font-size:22px;font-weight:700;color:#1e6e42;">${matched}</div>
       <div style="font-size:11px;color:#1e6e42;margin-top:2px;">Cards avançados</div>
+      ${matchedTolerantes > 0 ? `<div style="font-size:10px;color:#7a4a00;margin-top:3px;font-weight:500;">${matchedExatos} exato${matchedExatos!==1?'s':''} · ${matchedTolerantes} tolerante${matchedTolerantes!==1?'s':''}</div>` : ''}
     </div>
-    <div style="flex:1;background:${notFound.length ? '#fff5f5' : '#f5f5f5'};border:1px solid ${notFound.length ? '#f5b8b8' : '#e2e0d8'};border-radius:8px;padding:12px;text-align:center;">
+    <div style="background:#f0f4f8;border:1px solid #c5d5e0;border-radius:8px;padding:12px;text-align:center;">
+      <div style="font-size:22px;font-weight:700;color:#2a5558;">${alreadyResgatado.length}</div>
+      <div style="font-size:11px;color:#2a5558;margin-top:2px;">Já em Resgatado</div>
+    </div>
+    <div style="background:${notFound.length ? '#fff5f5' : '#f5f5f5'};border:1px solid ${notFound.length ? '#f5b8b8' : '#e2e0d8'};border-radius:8px;padding:12px;text-align:center;">
       <div style="font-size:22px;font-weight:700;color:${notFound.length ? '#b94040' : '#a09d96'};">${notFound.length}</div>
       <div style="font-size:11px;color:${notFound.length ? '#b94040' : '#a09d96'};margin-top:2px;">Não encontrados</div>
     </div>
   `;
   box.appendChild(summary);
 
+  // Se houve matches tolerantes, mostra lista com aviso visual
+  if (matchedTolerantes > 0) {
+    const warnBox = document.createElement('div');
+    warnBox.style.cssText = 'background:#fff8e0;border:1px solid #f0c068;border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:6px;';
+    const warnTitle = document.createElement('div');
+    warnTitle.style.cssText = 'font-size:12px;font-weight:600;color:#7a4a00;';
+    warnTitle.textContent = `⚠ ${matchedTolerantes} card${matchedTolerantes!==1?'s':''} movido${matchedTolerantes!==1?'s':''} por matching tolerante — revise se o casamento está correto:`;
+    warnBox.appendChild(warnTitle);
+    
+    const warnList = document.createElement('div');
+    warnList.style.cssText = 'display:flex;flex-direction:column;gap:3px;max-height:140px;overflow-y:auto;';
+    toleranteDetalhes.forEach(item => {
+      const row = document.createElement('div');
+      row.style.cssText = 'font-size:11px;color:#5a3800;background:#ffecc0;border-radius:4px;padding:5px 8px;font-family:DM Mono,monospace;';
+      row.textContent = item;
+      warnList.appendChild(row);
+    });
+    warnBox.appendChild(warnList);
+    box.appendChild(warnBox);
+  }
+
+  // Se houve "já em resgatado", mostra de forma colapsada (informativo, não é erro)
+  if (alreadyResgatado.length > 0) {
+    const detail = document.createElement('details');
+    detail.style.cssText = 'background:#f0f4f8;border:1px solid #c5d5e0;border-radius:8px;padding:8px 12px;';
+    const sum = document.createElement('summary');
+    sum.style.cssText = 'font-size:12px;font-weight:600;color:#2a5558;cursor:pointer;';
+    sum.textContent = `${alreadyResgatado.length} liquidaç${alreadyResgatado.length!==1?'ões':'ão'} do arquivo correspondem a card${alreadyResgatado.length!==1?'s':''} já em "Resgatado" (nenhuma ação necessária)`;
+    detail.appendChild(sum);
+    const list = document.createElement('div');
+    list.style.cssText = 'display:flex;flex-direction:column;gap:3px;max-height:140px;overflow-y:auto;margin-top:8px;';
+    alreadyResgatado.slice(0, 50).forEach(item => {
+      const row = document.createElement('div');
+      row.style.cssText = 'font-size:11px;color:#2a5558;background:#e0eaf0;border-radius:4px;padding:4px 8px;font-family:DM Mono,monospace;';
+      row.textContent = item;
+      list.appendChild(row);
+    });
+    if (alreadyResgatado.length > 50) {
+      const more = document.createElement('div');
+      more.style.cssText = 'font-size:11px;color:#6b6860;text-align:center;padding:4px;font-style:italic;';
+      more.textContent = `... e mais ${alreadyResgatado.length - 50} não exibidos`;
+      list.appendChild(more);
+    }
+    detail.appendChild(list);
+    box.appendChild(detail);
+  }
+
   if (notFound.length) {
     const label = document.createElement('div');
-    label.style.cssText = 'font-size:11px;font-weight:600;color:#6b6860;text-transform:uppercase;letter-spacing:.05em;';
-    label.textContent = 'Não encontrados:';
+    label.style.cssText = 'font-size:11px;font-weight:600;color:#b94040;text-transform:uppercase;letter-spacing:.05em;margin-top:4px;';
+    label.textContent = `Não encontrados (${notFound.length}):`;
     box.appendChild(label);
 
+    const hint = document.createElement('div');
+    hint.style.cssText = 'font-size:11px;color:#6b6860;';
+    hint.textContent = 'Liquidações no arquivo sem card correspondente no Kanban. Pode ser cliente/ativo/valor/tipo que não bateu, ou operação registrada em outro sistema.';
+    box.appendChild(hint);
+
     const list = document.createElement('div');
-    list.style.cssText = 'display:flex;flex-direction:column;gap:4px;max-height:200px;overflow-y:auto;';
-    notFound.forEach(item => {
+    list.style.cssText = 'display:flex;flex-direction:column;gap:4px;max-height:220px;overflow-y:auto;';
+    notFound.slice(0, 100).forEach(item => {
       const row = document.createElement('div');
       row.style.cssText = 'font-size:12px;color:#6b6860;background:#f5f4f0;border-radius:5px;padding:6px 10px;font-family:DM Mono,monospace;';
       row.textContent = item;
       list.appendChild(row);
     });
+    if (notFound.length > 100) {
+      const more = document.createElement('div');
+      more.style.cssText = 'font-size:11px;color:#6b6860;text-align:center;padding:4px;font-style:italic;';
+      more.textContent = `... e mais ${notFound.length - 100} não exibidos`;
+      list.appendChild(more);
+    }
     box.appendChild(list);
   }
 
