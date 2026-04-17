@@ -41,10 +41,12 @@ const CODE_VERSION = 4;
 onAuthStateChanged(auth, user => {
   if (user) {
     currentUser = user;
+    window.currentUser = user;  // expõe para funções fora do módulo
     showApp(user);
     startListening();
   } else {
     currentUser = null;
+    window.currentUser = null;
     showLogin();
   }
 });
@@ -3266,33 +3268,44 @@ function abrirModalLimparResgatado(col) {
 
 // Executa o arquivamento: remove do col, adiciona em data.arquivados
 function executarLimpezaResgatado(col, elegiveis) {
-  if (!data.arquivados) data.arquivados = [];
-  
-  const timestamp = new Date().toISOString();
-  const arquivadorEmail = (currentUser && currentUser.email) || 'desconhecido';
-  
-  elegiveis.forEach(card => {
-    // Enriquece com metadados de arquivamento
-    const arquivado = {
-      ...card,
-      _archivedAt: timestamp,
-      _archivedBy: arquivadorEmail,
-      _archivedFromCol: col.name,
-    };
-    data.arquivados.push(arquivado);
-  });
-  
-  // Remove os arquivados da coluna
-  const idsArquivados = new Set(elegiveis.map(c => c.id));
-  col.cards = col.cards.filter(c => !idsArquivados.has(c.id));
-  
-  render();
-  save();
-  
-  // Feedback
-  setTimeout(() => {
-    alert(`✓ ${elegiveis.length} card${elegiveis.length!==1?'s':''} arquivado${elegiveis.length!==1?'s':''}.\n\nPara consultar o histórico, use o botão "Histórico" no cabeçalho do app.`);
-  }, 100);
+  try {
+    if (!data.arquivados) data.arquivados = [];
+    
+    const timestamp = new Date().toISOString();
+    // Acessa currentUser de forma defensiva — pode não estar disponível
+    let arquivadorEmail = 'desconhecido';
+    try {
+      arquivadorEmail = (window.currentUser && window.currentUser.email)
+        || (typeof currentUser !== 'undefined' && currentUser && currentUser.email)
+        || 'desconhecido';
+    } catch(e) { /* currentUser indefinido, mantém 'desconhecido' */ }
+    
+    elegiveis.forEach(card => {
+      // Enriquece com metadados de arquivamento
+      const arquivado = {
+        ...card,
+        _archivedAt: timestamp,
+        _archivedBy: arquivadorEmail,
+        _archivedFromCol: col.name,
+      };
+      data.arquivados.push(arquivado);
+    });
+    
+    // Remove os arquivados da coluna
+    const idsArquivados = new Set(elegiveis.map(c => c.id));
+    col.cards = col.cards.filter(c => !idsArquivados.has(c.id));
+    
+    render();
+    save();
+    
+    // Feedback
+    setTimeout(() => {
+      alert(`✓ ${elegiveis.length} card${elegiveis.length!==1?'s':''} arquivado${elegiveis.length!==1?'s':''}.\n\nPara consultar o histórico, use o botão 📁 no cabeçalho do app.`);
+    }, 100);
+  } catch(err) {
+    console.error('Erro ao arquivar:', err);
+    alert('Erro ao arquivar cards:\n\n' + (err.message || err) + '\n\nAbra o console (F12) para ver detalhes.');
+  }
 }
 
 // Modal de consulta ao histórico arquivado
