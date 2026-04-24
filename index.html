@@ -41,12 +41,10 @@ const CODE_VERSION = 4;
 onAuthStateChanged(auth, user => {
   if (user) {
     currentUser = user;
-    window.currentUser = user;  // expõe para funções fora do módulo
     showApp(user);
     startListening();
   } else {
     currentUser = null;
-    window.currentUser = null;
     showLogin();
   }
 });
@@ -2551,7 +2549,7 @@ async function exportCol(col) {
 
   // Resgate Total e Parcial → "Resgate"; Aporte → "Aporte"
   const OP_LABELS = { resgate_total: 'Resgate', resgate_parcial: 'Resgate', aplicacao: 'Aporte' };
-  const headers = ['Data','Tipo','Operação','Cliente','Bco','Ag','Conta','Tipo Conta Turim','Produto','Quantidade','PU','Total','Valor','IR','Interna','Classificação','Observação','Evento','Data de Cotização','Data de Liquidação','Bco Destino','Ag Destino','Conta Destino','Tipo Conta Turim Destino','Produto Destino','Data de Cotização','Data de Liquidação','Tipo Confirmação','Tipo Assinatura','CHECK'];
+  const headers = ['Data','Tipo','Operação','Cliente','Bco','Ag','Conta','Tipo Conta Turim','Produto','Quantidade','PU','Total','Valor','IR','Interna','Classificação','Observação','Evento','Data de Cotização','Data de Liquidação','Bco Destino','Ag Destino','Conta Destino','Tipo Conta Turim Destino','Produto Destino','Data de Cotização','Data de Liquidação','Tipo Confirmação','Tipo Assinatura','Envia E-mail','CHECK'];
 
   // Converte DD/MM/YY ou DD/MM/YYYY para número serial do Excel
   function dateToSerial(str) {
@@ -2599,7 +2597,9 @@ async function exportCol(col) {
       '','','','','',       // 20-24
       card.cotDate||'',     // 25
       card.liqDate||'',     // 26
-      '','',''              // 27-29
+      '','',                // 27-28 (Tipo Confirmação, Tipo Assinatura)
+      'Sim',                // 29 - Envia E-mail
+      ''                    // 30 - CHECK
     ];
   });
 
@@ -3179,8 +3179,14 @@ function parseLiqDate(s) {
   return isNaN(dt.getTime()) ? null : dt;
 }
 
-// Checa se a liqDate do card já passou (<= hoje)
+// Checa se o card está pronto para ser arquivado:
+// - Aportes: sempre elegíveis ao chegar em Resgatado (a operação já concluiu)
+// - Resgates: só quando liqDate já passou
 function cardLiqDateVencida(card) {
+  // Aporte: sempre elegível
+  if (card.operation === 'aplicacao') return true;
+  
+  // Resgate: precisa de liqDate preenchida e vencida
   const dt = parseLiqDate(card.liqDate);
   if (!dt) return false;  // sem data definida = não mexe
   const hoje = new Date();
@@ -3193,7 +3199,7 @@ function abrirModalLimparResgatado(col) {
   const elegiveis = col.cards.filter(cardLiqDateVencida);
   
   if (elegiveis.length === 0) {
-    alert('Nenhum card em Resgatado tem data de liquidação vencida.\n\nApenas cards com "LIQUIDAÇÃO" <= hoje são arquivados. Cards sem data de liquidação preenchida não são afetados.');
+    alert('Nenhum card em Resgatado está pronto para arquivamento.\n\nRegra: aportes são arquivados imediatamente ao chegar em Resgatado. Resgates só são arquivados quando a data de liquidação já passou.');
     return;
   }
   
@@ -3214,7 +3220,7 @@ function abrirModalLimparResgatado(col) {
   
   const desc = document.createElement('div');
   desc.style.cssText = 'font-size:12px;color:#6b6860;line-height:1.5;';
-  desc.innerHTML = `Cards com <strong>data de liquidação já vencida</strong> (<= hoje) serão movidos para o histórico arquivado. Continuam salvos no Firebase e podem ser consultados, mas somem do Kanban. <br><br><strong>Total no Kanban:</strong> ${col.cards.length} cards em Resgatado<br><strong>Sem data ou data futura:</strong> ${col.cards.length - elegiveis.length} (não serão afetados)<br><strong>A arquivar:</strong> ${elegiveis.length}`;
+  desc.innerHTML = `Serão arquivados todos os <strong>aportes</strong> (já concluídos ao chegar em Resgatado) e os <strong>resgates com liquidação vencida</strong> (liqDate &le; hoje). Cards continuam salvos no Firebase e podem ser consultados pelo 📁 no cabeçalho. <br><br><strong>Total no Kanban:</strong> ${col.cards.length} cards em Resgatado<br><strong>Não serão afetados:</strong> ${col.cards.length - elegiveis.length} (resgates com liq futura ou sem data)<br><strong>A arquivar:</strong> ${elegiveis.length}`;
   box.appendChild(desc);
   
   // Lista dos cards que serão arquivados
@@ -3230,10 +3236,16 @@ function abrirModalLimparResgatado(col) {
     row.style.cssText = 'font-size:11px;color:#6b6860;background:#f5f4f0;border-radius:4px;padding:6px 10px;font-family:DM Mono,monospace;display:flex;justify-content:space-between;gap:8px;';
     const left = document.createElement('div');
     left.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
-    left.textContent = `${card.cliente || '?'} | ${card.fundo || '?'} | R$ ${card.value || '?'}`;
+    const tipoLabel = card.operation === 'aplicacao' ? 'Aporte' : (card.operation === 'resgate_total' ? 'Resg.Total' : 'Resg.Parc.');
+    left.textContent = `${card.cliente || '?'} | ${tipoLabel} | ${card.fundo || '?'} | R$ ${card.value || '?'}`;
     const right = document.createElement('div');
     right.style.cssText = 'color:#b94040;font-weight:600;flex-shrink:0;';
-    right.textContent = `Liq: ${card.liqDate}`;
+    if (card.operation === 'aplicacao') {
+      right.textContent = 'pronto';
+      right.style.color = '#1e6e42';
+    } else {
+      right.textContent = `Liq: ${card.liqDate || '—'}`;
+    }
     row.appendChild(left);
     row.appendChild(right);
     list.appendChild(row);
@@ -3268,44 +3280,33 @@ function abrirModalLimparResgatado(col) {
 
 // Executa o arquivamento: remove do col, adiciona em data.arquivados
 function executarLimpezaResgatado(col, elegiveis) {
-  try {
-    if (!data.arquivados) data.arquivados = [];
-    
-    const timestamp = new Date().toISOString();
-    // Acessa currentUser de forma defensiva — pode não estar disponível
-    let arquivadorEmail = 'desconhecido';
-    try {
-      arquivadorEmail = (window.currentUser && window.currentUser.email)
-        || (typeof currentUser !== 'undefined' && currentUser && currentUser.email)
-        || 'desconhecido';
-    } catch(e) { /* currentUser indefinido, mantém 'desconhecido' */ }
-    
-    elegiveis.forEach(card => {
-      // Enriquece com metadados de arquivamento
-      const arquivado = {
-        ...card,
-        _archivedAt: timestamp,
-        _archivedBy: arquivadorEmail,
-        _archivedFromCol: col.name,
-      };
-      data.arquivados.push(arquivado);
-    });
-    
-    // Remove os arquivados da coluna
-    const idsArquivados = new Set(elegiveis.map(c => c.id));
-    col.cards = col.cards.filter(c => !idsArquivados.has(c.id));
-    
-    render();
-    save();
-    
-    // Feedback
-    setTimeout(() => {
-      alert(`✓ ${elegiveis.length} card${elegiveis.length!==1?'s':''} arquivado${elegiveis.length!==1?'s':''}.\n\nPara consultar o histórico, use o botão 📁 no cabeçalho do app.`);
-    }, 100);
-  } catch(err) {
-    console.error('Erro ao arquivar:', err);
-    alert('Erro ao arquivar cards:\n\n' + (err.message || err) + '\n\nAbra o console (F12) para ver detalhes.');
-  }
+  if (!data.arquivados) data.arquivados = [];
+  
+  const timestamp = new Date().toISOString();
+  const arquivadorEmail = (currentUser && currentUser.email) || 'desconhecido';
+  
+  elegiveis.forEach(card => {
+    // Enriquece com metadados de arquivamento
+    const arquivado = {
+      ...card,
+      _archivedAt: timestamp,
+      _archivedBy: arquivadorEmail,
+      _archivedFromCol: col.name,
+    };
+    data.arquivados.push(arquivado);
+  });
+  
+  // Remove os arquivados da coluna
+  const idsArquivados = new Set(elegiveis.map(c => c.id));
+  col.cards = col.cards.filter(c => !idsArquivados.has(c.id));
+  
+  render();
+  save();
+  
+  // Feedback
+  setTimeout(() => {
+    alert(`✓ ${elegiveis.length} card${elegiveis.length!==1?'s':''} arquivado${elegiveis.length!==1?'s':''}.\n\nPara consultar o histórico, use o botão "Histórico" no cabeçalho do app.`);
+  }, 100);
 }
 
 // Modal de consulta ao histórico arquivado
