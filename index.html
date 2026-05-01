@@ -2940,10 +2940,12 @@ function processarLiquidacoes(input) {
 
       // Status do arquivo que disparam movimento do card para Resgatado
       function statusValido(status) {
-        const s = String(status || '').trim().toLowerCase();
+        const s = String(status || '').trim().toLowerCase()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g, ''); // remove acentos
         return s === 'enviado' || s === 'enviada'
             || s === 'boletado no adm'
-            || s === 'liquidado' || s === 'liquidada';
+            || s === 'liquidado' || s === 'liquidada'
+            || s === 'concluido' || s === 'concluida';
       }
 
       const liquidadas = rows.filter(row => {
@@ -2952,7 +2954,7 @@ function processarLiquidacoes(input) {
       });
 
       if (!liquidadas.length) {
-        alert('Nenhuma linha com status "Enviado", "Boletado no Adm" ou "Liquidada" encontrada no arquivo.');
+        alert('Nenhuma linha com status "Enviado", "Boletado no Adm", "Liquidada" ou "Concluído" encontrada no arquivo.');
         return;
       }
 
@@ -2980,10 +2982,22 @@ function processarLiquidacoes(input) {
         // Substituições antes de remover sufixos
         n = n.replace(/\blimitada\b/g, 'ltda');
         n = n.replace(/\bresponsabilidade\b/g, 'resp');
+        n = n.replace(/\bsubclasse\b/g, '');
+        n = n.replace(/\bcredito\b/g, 'cred');
+        n = n.replace(/\bprivado\b/g, 'priv');
+        n = n.replace(/\binvestimento\b/g, 'inv');
+        n = n.replace(/\bcotas\b/g, '');
         // Remove pontuação (exceto espaços e alfanuméricos)
         n = n.replace(/[^a-z0-9 ]/g, ' ');
-        // Remove sufixos comuns de fundos no final (iterativamente)
-        const sufixos = ['fim cp', 'fim rf', 'fic cp', 'fic rf', 'fic fim', 'fic fif', 'cic rf', 'fif rf', 'rf cp', 'fim', 'fic', 'fif', 'cic', 'rfc', 'rf', 'cp', 'ltda', 'resp', 'multi'];
+        // Lista de sufixos ampliada (removidos iterativamente do final)
+        const sufixos = [
+          'fim cp', 'fim rf', 'fic cp', 'fic rf', 'fic fim', 'fic fif',
+          'cic rf', 'cic fim', 'fif rf', 'fif fim', 'rf cp', 'fim cred priv',
+          'fic fim cred priv', 'fim cred', 'rf cred priv',
+          'fim', 'fic', 'fif', 'cic', 'rfc', 'rf', 'cp',
+          'ltda', 'resp', 'multi', 'cred', 'priv', 'inv',
+          'classe', 'subclasse', 'tori', 'sp', 'spc', 'da'
+        ];
         let prev = '';
         while (prev !== n) {
           prev = n;
